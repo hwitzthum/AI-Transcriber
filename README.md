@@ -1,0 +1,222 @@
+# 🎙️ Transcriber
+
+Production-ready audio and video transcription powered by cloud AI. Optimised for **multilingual content** including German and French, with formatted output and speaker identification.
+
+---
+
+## Features
+
+### Transcription
+- **Multiple cloud providers** — OpenAI Whisper API, Groq, Deepgram Nova-2, Deepgram Nova-3 Multilingual
+- **Multilingual support** — Auto-detect or select a language; Nova-3 handles code-switching (German/French in the same recording)
+- **Speaker diarization** — Identifies individual speakers (Deepgram only)
+- **Large file support** — Automatic chunking and memory-efficient streaming for files of any size
+- **Video support** — Extracts audio from MP4, MOV, AVI, MKV, and more
+- **All audio formats** — MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, WEBM, and more
+
+### Output Quality
+- **Chunk deduplication** — Removes repeated text at chunk boundaries
+- **Garbage detection** — Warns when output looks like hallucination or wrong language
+- **Graceful degradation** — Failed chunks are skipped, not fatal; gaps are flagged
+- **Smart retry logic** — Retries on rate limits and server errors; fails immediately on bad API keys
+
+### Readability
+- **Paragraph breaks** — Automatically inserted at natural pauses (>1.5 s silence) and speaker changes
+- **Speaker labels** — Formatted bold on their own line (`**Speaker 0:**`) for clear visual separation
+- **Speaker renaming** — Replace generic "Speaker 0" labels with actual names (e.g., Maria, John)
+- **Filler word highlighting** — Marks um, uh, äh, euh, like, basically in italic for easy review (English, German, French)
+- **Search & highlight** — Find and highlight any word or phrase in the preview
+
+### Editor
+- **Edit / Preview modes** — Toggle between raw text editing and a formatted visual preview
+- **Reading time estimate** — Shows word count, character count, and estimated reading time
+- **ETA progress** — Live estimated time remaining during transcription of large files
+
+### Export
+- **DOCX** — Formatted Word document with bold speaker labels (blue), indented content, and italic filler words
+- **PDF** — Unicode-capable export (supports ü, ö, ä, œ, é, etc.) with colour-coded speaker labels
+
+---
+
+## Prerequisites
+
+| Requirement | Version | Install |
+|---|---|---|
+| Python | 3.11+ | [python.org](https://python.org) |
+| uv | latest | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| ffmpeg | any | `brew install ffmpeg` |
+
+---
+
+## Setup
+
+```bash
+git clone <repo-url>
+cd Transcriber
+
+# Install dependencies (uv handles the venv automatically)
+uv sync
+
+# Run the app
+uv run streamlit run app.py
+```
+
+The app opens at `http://localhost:8501`.
+
+---
+
+## Tutorial
+
+### 1. Choose a Provider and Enter Your API Key
+
+Open the **sidebar** (left panel). Select a transcription provider:
+
+| Provider | Best For | Cost |
+|---|---|---|
+| **OpenAI Whisper API** | General accuracy | ~$0.006/min |
+| **Groq (whisper-large-v3-turbo)** | Speed, low cost | Free tier available |
+| **Deepgram Nova-2** | Speaker identification | Pay-as-you-go |
+| **Deepgram Nova-3 Multilingual** | Mixed German/French audio | Pay-as-you-go |
+
+Paste your API key into the **API Key** field. Keys are session-only and never stored.
+
+---
+
+### 2. Set the Language
+
+Under **Language**, choose:
+- **Auto-detect** — the API identifies the language automatically
+- **German / French / English** — set explicitly for best accuracy on single-language files
+
+> **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 Multilingual** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
+
+---
+
+### 3. Enable Speaker Diarization (Optional)
+
+If your recording has **multiple speakers** (e.g., an interview or meeting), tick **Enable Speaker Diarization** in the sidebar.
+
+This is only available with Deepgram providers. When enabled, the transcript labels each speaker:
+
+```
+**Speaker 0:**
+Guten Morgen, willkommen zur Konferenz.
+
+**Speaker 1:**
+Merci beaucoup pour l'invitation.
+```
+
+Paragraphs are automatically inserted at:
+- **Speaker changes** — every time a different person speaks
+- **Natural pauses** — silence gaps longer than 1.5 seconds
+
+---
+
+### 4. Upload Your File
+
+Either:
+- **Drag and drop** a file into the upload area, or
+- **Paste a file path** (e.g., `/Users/you/meeting.mp4`) into the path field
+
+Audio info (duration, size, sample rate) is displayed immediately. Large files will be split into chunks automatically — you will see a notice.
+
+---
+
+### 5. Transcribe
+
+Click **🚀 Start Transcription**.
+
+A progress bar and live status show which chunk is being processed, plus an estimated time remaining (ETA) for large files.
+
+When complete:
+- A detected language notice appears if Auto-detect was used
+- Any failed chunks or quality warnings are shown
+- 🎉 Balloons appear on success
+
+---
+
+### 6. Review and Edit the Transcript
+
+The transcript appears in the **Edit / Preview** panel.
+
+#### Edit Mode
+The raw text editor — make any corrections directly. Speaker labels follow the format `**Speaker X:**` on their own line.
+
+#### Preview Mode
+A formatted visual view. Use the **Search** box to find and highlight specific words or names.
+
+---
+
+### 7. Improve Readability
+
+Expand **📖 Readability Options**:
+
+**Highlight filler words** — tick the checkbox and click **Apply Filler Highlighting**. Filler words (um, uh, äh, euh, like, basically, etc.) appear in *italic gray* so you can spot them at a glance. They are stripped cleanly on export.
+
+---
+
+### 8. Rename Speakers
+
+If diarization is enabled, expand **👥 Rename Speakers**. Type the actual name for each speaker and click **Apply Speaker Names**:
+
+```
+Speaker 0 → Maria
+Speaker 1 → Jean-Paul
+```
+
+The labels update throughout the entire transcript instantly. Exported documents use the custom names.
+
+---
+
+### 9. Download
+
+Click **📄 Download DOCX** or **📕 Download PDF**.
+
+Both formats include:
+- Speaker names in **bold blue** on their own line
+- Speaker text indented beneath the label
+- Filler words in *italic gray* (DOCX) or removed (PDF)
+- Full Unicode support — ü, ö, ä, ß, œ, é, è, à all render correctly
+
+---
+
+## Project Structure
+
+```
+Transcriber/
+├── app.py                   # Streamlit entry point and UI
+├── transcriber/
+│   ├── __init__.py
+│   ├── audio_processor.py   # Format conversion, chunking, ffprobe metadata
+│   ├── cloud_engine.py      # OpenAI / Groq / Deepgram API, retry logic, deduplication
+│   ├── exporter.py          # DOCX and PDF export with speaker formatting
+│   └── text_processor.py    # Filler detection, speaker renaming, search highlight
+├── tests/
+│   ├── test_all.py          # Core test suite (audio, chunking, export)
+│   └── test_cloud_engine.py # Cloud engine unit tests (retry, dedup, garbage detection)
+├── pyproject.toml
+└── README.md
+```
+
+---
+
+## Running Tests
+
+```bash
+uv run python tests/test_all.py
+uv run python tests/test_cloud_engine.py
+```
+
+All tests are offline — no API keys required.
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| Transcript is in English even though audio is German | Make sure **Auto-detect** is selected and you are using Deepgram, not OpenAI/Groq |
+| PDF shows `?` for ü/ä/ö/œ | Arial Unicode must be installed — on macOS it lives in `/System/Library/Fonts/Supplemental/` |
+| Transcription fails immediately | Check your API key — invalid keys are rejected without retrying |
+| Large file runs out of memory | The app streams files >200 MB through ffmpeg; ensure ffmpeg is installed |
+| Duplicate words at chunk boundaries | Handled automatically by the deduplication step |
