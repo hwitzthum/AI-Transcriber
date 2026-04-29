@@ -77,6 +77,20 @@ _LANGUAGE_NAME_TO_ISO = {
     "czech": "cs",
     "greek": "el",
     "hindi": "hi",
+    "hungarian": "hu",
+    "ukrainian": "uk",
+    "indonesian": "id",
+    "vietnamese": "vi",
+    "romanian": "ro",
+    "catalan": "ca",
+    "slovak": "sk",
+    "bulgarian": "bg",
+    "malay": "ms",
+    "thai": "th",
+    "hebrew": "he",
+    "persian": "fa",
+    "farsi": "fa",
+    "mandarin": "zh",
 }
 
 
