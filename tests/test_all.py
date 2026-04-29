@@ -86,6 +86,36 @@ def test_audio_validation():
     print("\n  ✅ All validation tests PASSED")
 
 
+def test_chunking_threshold_per_provider():
+    """A file under the OpenAI 24 MB limit reports needs_chunking=False;
+    the same file with a tiny 1 KB limit reports True. Demonstrates the
+    per-provider knob without needing a 25 MB fixture."""
+    separator("Chunking Threshold (Per-Provider)")
+
+    test_file = "tests/test_english.mp3"
+    size = os.path.getsize(test_file)
+    print(f"  Test file size: {size} bytes ({size / 1024:.1f} KB)")
+
+    # With the default OpenAI/Groq limit, the small test fixture fits in one chunk
+    assert not audio_processor.needs_chunking(test_file), (
+        "Small test file should NOT need chunking at default OpenAI limit"
+    )
+    print(f"  ✅ Default OpenAI limit: small file does not need chunking")
+
+    # With an artificially tiny limit, the same file should need chunking
+    assert audio_processor.needs_chunking(test_file, max_bytes=1024), (
+        "Test file should need chunking when limit is 1 KB"
+    )
+    print(f"  ✅ Tiny 1 KB limit: file needs chunking")
+
+    # And chunk_audio must respect the parameterised limit: a tiny limit
+    # produces multiple chunk paths, the default limit produces one.
+    single = audio_processor.chunk_audio(test_file)
+    assert len(single) == 1, f"Expected 1 chunk at default limit, got {len(single)}"
+    audio_processor.cleanup_chunks(single, test_file)
+    print(f"  ✅ Single-chunk path returns 1 file at default limit")
+
+
 def test_audio_info():
     """Test 2: Audio metadata extraction."""
     separator("Audio Metadata Extraction")
@@ -103,48 +133,41 @@ def test_audio_info():
 
 
 def test_chunking_logic():
-    """Test 3: Chunking — verify the small file doesn't get split, 
-    and test chunking with a forced lower threshold."""
+    """Test 3: Chunking — verify the small file doesn't get split,
+    and test chunking with a forced lower threshold via the max_bytes kwarg."""
     separator("Chunking Logic")
-    
-    # Small file should NOT need chunking
+
+    # Small file should NOT need chunking at the default OpenAI/Groq limit
     needs = audio_processor.needs_chunking("tests/test_english.mp3")
     print(f"  Small file needs chunking: {needs}")
     assert not needs, "Small file should not need chunking"
     print(f"  ✅ Small file correctly skips chunking")
-    
-    # Test chunking with artificially low threshold
-    original_max = audio_processor.MAX_CHUNK_BYTES
-    try:
-        # Force chunking by setting threshold very low (5 KB)
-        audio_processor.MAX_CHUNK_BYTES = 5 * 1024
-        
-        needs = audio_processor.needs_chunking("tests/test_english.mp3")
-        print(f"  With 5KB threshold, needs chunking: {needs}")
-        assert needs, "Should need chunking with 5KB threshold"
-        
-        chunks = audio_processor.chunk_audio("tests/test_english.mp3")
-        print(f"  Chunk count: {len(chunks)}")
-        print(f"  Chunk files:")
-        for i, c in enumerate(chunks):
-            size = os.path.getsize(c) / 1024
-            print(f"    [{i}] {os.path.basename(c)} — {size:.1f} KB")
-        
-        assert len(chunks) > 1, "Should produce multiple chunks"
-        
-        # Verify all chunk files exist
-        for c in chunks:
-            assert os.path.exists(c), f"Chunk file missing: {c}"
-        
-        # Test cleanup
-        audio_processor.cleanup_chunks(chunks, "tests/test_english.mp3")
-        for c in chunks:
-            assert not os.path.exists(c), f"Chunk not cleaned up: {c}"
-        print(f"  ✅ Cleanup removed all {len(chunks)} temp chunks")
-        
-    finally:
-        audio_processor.MAX_CHUNK_BYTES = original_max
-    
+
+    # Force chunking by passing a tiny max_bytes — exercises the multi-chunk path.
+    forced_limit = 5 * 1024  # 5 KB
+    needs = audio_processor.needs_chunking("tests/test_english.mp3", max_bytes=forced_limit)
+    print(f"  With 5KB threshold, needs chunking: {needs}")
+    assert needs, "Should need chunking with 5KB threshold"
+
+    chunks = audio_processor.chunk_audio("tests/test_english.mp3", max_bytes=forced_limit)
+    print(f"  Chunk count: {len(chunks)}")
+    print(f"  Chunk files:")
+    for i, c in enumerate(chunks):
+        size = os.path.getsize(c) / 1024
+        print(f"    [{i}] {os.path.basename(c)} — {size:.1f} KB")
+
+    assert len(chunks) > 1, "Should produce multiple chunks"
+
+    # Verify all chunk files exist
+    for c in chunks:
+        assert os.path.exists(c), f"Chunk file missing: {c}"
+
+    # Test cleanup
+    audio_processor.cleanup_chunks(chunks, "tests/test_english.mp3")
+    for c in chunks:
+        assert not os.path.exists(c), f"Chunk not cleaned up: {c}"
+    print(f"  ✅ Cleanup removed all {len(chunks)} temp chunks")
+
     print("\n  ✅ Chunking logic PASSED")
 
 

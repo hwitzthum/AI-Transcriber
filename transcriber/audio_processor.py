@@ -187,21 +187,28 @@ def _get_audio_info_ffprobe(file_path: str) -> dict:
     }
 
 
-def needs_chunking(file_path: str) -> bool:
-    """Check if the file exceeds the chunk size limit."""
-    return os.path.getsize(file_path) > MAX_CHUNK_BYTES
+def needs_chunking(file_path: str, max_bytes: int = MAX_CHUNK_BYTES) -> bool:
+    """Check if the file exceeds the chunk size limit for the chosen provider."""
+    return os.path.getsize(file_path) > max_bytes
 
 
-def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
+def chunk_audio(
+    file_path: str,
+    progress_callback=None,
+    max_bytes: int = MAX_CHUNK_BYTES,
+) -> list[str]:
     """
     Split a large audio file into smaller chunks suitable for API upload.
 
-    For very large files (> _LARGE_FILE_THRESHOLD_MB) the function uses
-    ffmpeg directly to extract and slice audio without loading the entire
-    file into Python memory. This keeps RAM usage nearly constant regardless
-    of input file size and is critical for multi-hour recordings.
+    The ``max_bytes`` parameter lets each provider use its own upload ceiling:
+    OpenAI/Groq cap at ~24 MB while Deepgram accepts a single chunk up to
+    500 MB. Files at or below the limit are returned as a single-element list
+    (after being transcoded to MP3 if needed) so the API receives one upload
+    instead of many small chunks needlessly stitched back together.
 
-    For smaller files pydub is used (same behaviour as before).
+    For very large files (> _LARGE_FILE_THRESHOLD_MB) the function uses
+    ffmpeg directly to slice audio without loading the entire file into
+    Python memory. For smaller files pydub is used.
 
     Returns a list of temporary MP3 file paths. The caller is responsible for
     cleaning them up via cleanup_chunks().
@@ -209,6 +216,12 @@ def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
     file_size = os.path.getsize(file_path)
     file_size_mb = file_size / (1024 * 1024)
     is_video = Path(file_path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+    # --- Path 0: File already fits in one upload — skip chunking entirely. ---
+    # This is the dominant path for Deepgram and saves the overlap/dedup
+    # round-trip on files that the provider would happily ingest whole.
+    if file_size <= max_bytes and not is_video:
+        return [_ensure_mp3(file_path)]
 
     # --- Path 1: Very large files — stream directly through ffmpeg ---
     # This avoids loading gigabytes of audio into RAM and is essential for
@@ -219,7 +232,7 @@ def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
             file_size_mb,
             _LARGE_FILE_THRESHOLD_MB,
         )
-        return _chunk_with_ffmpeg(file_path, progress_callback)
+        return _chunk_with_ffmpeg(file_path, progress_callback, max_bytes=max_bytes)
 
     # --- Path 2: Medium-large video — extract audio first ---
     # For videos between 50 MB and the large threshold, extract audio track
@@ -236,7 +249,7 @@ def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
             logger.warning("Could not extract audio from video, falling back: %s", exc)
 
     # If file fits in one chunk (after possible audio extraction), skip splitting
-    if file_size <= MAX_CHUNK_BYTES:
+    if file_size <= max_bytes:
         if temp_audio_path:
             return [temp_audio_path]
         return [_ensure_mp3(file_path)]
@@ -245,10 +258,10 @@ def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
     audio = AudioSegment.from_file(processed_path)
     total_duration_ms = len(audio)
 
-    # Estimate chunk duration to stay under MAX_CHUNK_BYTES at 128 kbps
+    # Estimate chunk duration to stay under max_bytes at 128 kbps
     bitrate_kbps = 128
     bytes_per_ms = (bitrate_kbps * 1000) / 8 / 1000
-    chunk_duration_ms = int(MAX_CHUNK_BYTES / bytes_per_ms)
+    chunk_duration_ms = int(max_bytes / bytes_per_ms)
 
     # Safety: chunk duration must be larger than overlap
     chunk_duration_ms = max(chunk_duration_ms, OVERLAP_MS + 1000)
@@ -328,7 +341,11 @@ def _get_duration_seconds(file_path: str) -> float:
         )
 
 
-def _chunk_with_ffmpeg(file_path: str, progress_callback=None) -> list[str]:
+def _chunk_with_ffmpeg(
+    file_path: str,
+    progress_callback=None,
+    max_bytes: int = MAX_CHUNK_BYTES,
+) -> list[str]:
     """
     Slice a file into MP3 chunks using ffmpeg without loading it into RAM.
 
@@ -341,10 +358,10 @@ def _chunk_with_ffmpeg(file_path: str, progress_callback=None) -> list[str]:
     """
     total_seconds = _get_duration_seconds(file_path)
 
-    # Calculate chunk and step duration to stay under MAX_CHUNK_BYTES at 128 kbps
+    # Calculate chunk and step duration to stay under max_bytes at 128 kbps
     bitrate_kbps = 128
     bytes_per_second = (bitrate_kbps * 1000) / 8
-    chunk_duration_sec = MAX_CHUNK_BYTES / bytes_per_second
+    chunk_duration_sec = max_bytes / bytes_per_second
     overlap_sec = OVERLAP_MS / 1000.0
     step_sec = chunk_duration_sec - overlap_sec
 

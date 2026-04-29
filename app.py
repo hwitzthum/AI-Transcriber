@@ -1047,18 +1047,24 @@ if audio_file_path:
     try:
         info = audio_processor.get_audio_info(audio_file_path)
         st.session_state.audio_info = info
-        
+
         # Display audio info
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("⏱️ Duration", info["duration_formatted"])
         col2.metric("📦 Size", f"{info['file_size_mb']:.1f} MB")
         col3.metric("🔊 Channels", info["channels"])
         col4.metric("📊 Sample Rate", f"{info['sample_rate']} Hz")
-        
-        needs_split = audio_processor.needs_chunking(audio_file_path)
+
+        # Use the chosen provider's upload limit so the "needs chunking" hint
+        # only fires when this specific provider would actually need it.
+        provider_max_chunk_bytes = cloud_engine.get_max_chunk_bytes(cloud_provider)
+        needs_split = audio_processor.needs_chunking(
+            audio_file_path,
+            max_bytes=provider_max_chunk_bytes,
+        )
         if needs_split:
             st.info("📎 This file is large and will be split into chunks for processing.")
-        
+
     except Exception as e:
         st.error(f"❌ Could not read audio file: {e}")
         audio_file_path = None
@@ -1088,9 +1094,13 @@ if audio_file_path:
         # chunk_audio() itself raises before returning a list.
         chunk_paths: list[str] = []
         try:
-            # Step 1: Chunk the audio
+            # Step 1: Chunk the audio (using provider-specific upload ceiling).
             status_text.markdown("⏳ **Preparing audio...**")
-            chunk_paths = audio_processor.chunk_audio(audio_file_path, progress_callback=update_progress)
+            chunk_paths = audio_processor.chunk_audio(
+                audio_file_path,
+                progress_callback=update_progress,
+                max_bytes=cloud_engine.get_max_chunk_bytes(cloud_provider),
+            )
 
             # Step 2: Transcribe (Cloud Only)
 
