@@ -14,10 +14,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from fpdf import FPDF
 
 
-# Regex to match speaker labels like **Speaker 0:** or **Speaker 1:**
-_SPEAKER_PATTERN = re.compile(r"^\*\*Speaker (\d+):\*\*$", re.MULTILINE)
-
-# Regex to match filler words marked with underscores like _um_ or _uh_
+# Regex to match filler words marked with underscores like _um_ or _uh_.
+# Speaker labels are parsed by ``_parse_speaker_block`` using a broader
+# pattern that handles renamed speakers too — there is no separate
+# Speaker-only regex here on purpose.
 _FILLER_PATTERN = re.compile(r"_([^_]+)_")
 
 

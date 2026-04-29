@@ -413,45 +413,8 @@ def test_provider_max_chunk_bytes():
     print("  ✅ Per-provider chunk limits configured correctly")
 
 
-if __name__ == "__main__":
-    print("\n" + "🧪" * 30)
-    print("  CLOUD ENGINE UNIT TESTS")
-    print("🧪" * 30)
-
-    all_passed = True
-    results = {}
-
-    tests = [
-        ("Smart Retry Predicate", test_retry_predicate),
-        ("Overlap Deduplication", test_overlap_deduplication),
-        ("Garbage Detection", test_garbage_detection),
-        ("Provider Validation", test_provider_validation),
-        ("ETA Estimation", test_eta_estimation),
-        ("Overlap Length Detection", test_find_overlap_length),
-    ]
-
-    for name, test_fn in tests:
-        try:
-            test_fn()
-            results[name] = "✅ PASSED"
-        except Exception as e:
-            results[name] = f"❌ FAILED: {e}"
-            all_passed = False
-            import traceback
-            traceback.print_exc()
-
-    # Summary
-    print("\n" + "=" * 60)
-    print("  CLOUD ENGINE TEST SUMMARY")
-    print("=" * 60)
-    for name, result in results.items():
-        print(f"  {result}  {name}")
-
-    print(f"\n{'='*60}")
-    if all_passed:
-        print("  🎉 ALL CLOUD ENGINE TESTS PASSED!")
-    else:
-        print("  ⚠️  SOME TESTS FAILED — see above for details")
-    print(f"{'='*60}\n")
-
-    sys.exit(0 if all_passed else 1)
+# Run with: uv run pytest tests/
+# The previous __main__ block omitted the Deepgram paragraphs/words
+# formatter tests from its hand-curated list, so running this file
+# directly produced incomplete coverage. Pytest discovery picks up
+# every test_* function automatically.

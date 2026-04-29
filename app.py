@@ -11,12 +11,15 @@ Run with: uv run streamlit run app.py
 import os
 import tempfile
 import logging
+from pathlib import Path
+
 import streamlit as st
 
 from transcriber import audio_processor
 from transcriber import cloud_engine
 from transcriber import exporter
 from transcriber import text_processor
+from transcriber.language import MULTI_SENTINEL, normalize_language_to_iso
 
 
 @st.cache_data(show_spinner=False)
@@ -43,9 +46,13 @@ def _get_cached_upload_path(uploaded_file) -> str:
 
     Uses session state to cache the temp file path based on file content hash.
     This prevents writing duplicate temp files on every Streamlit re-run.
+    The original filename is mixed into the cache key alongside the
+    head/tail/size hash so two files of identical size whose first and
+    last 64 KB happen to match (rare but possible — same template, same
+    container) don't silently share a cached temp path.
     """
     file_hash = audio_processor.compute_upload_hash(uploaded_file)
-    cache_key = f"_upload_cache_{file_hash}"
+    cache_key = f"_upload_cache_{uploaded_file.name}_{file_hash}"
 
     # Check if we already have a cached path for this exact file
     if cache_key in st.session_state:
@@ -94,40 +101,27 @@ def _cached_export_pdf(text: str, title: str) -> bytes:
     return exporter.export_pdf(text, title=title)
 
 
-# Whisper returns full language names ("french"), Deepgram returns ISO-639-1
-# codes ("fr"). Map both forms to a canonical ISO-2 code so we can compare
-# against the dropdown selection.
-_LANGUAGE_NAME_TO_ISO = {
-    "english": "en",
-    "german": "de",
-    "deutsch": "de",
-    "french": "fr",
-    "français": "fr",
-    "francais": "fr",
-    "spanish": "es",
-    "español": "es",
-    "espanol": "es",
-    "italian": "it",
-    "italiano": "it",
-}
+# Preview-mode helpers run on every Streamlit rerun. The search box in the
+# preview re-runs the whole script per keystroke, which used to re-execute
+# the multi-pass regex in render_transcript_html and the markdown-stripping
+# regex in get_reading_stats over the full transcript every time. Caching
+# on the (text, query) tuple cuts that to one execution per unique input.
+@st.cache_data(show_spinner=False)
+def _cached_render_transcript_html(text: str, search_query: str) -> str:
+    return text_processor.render_transcript_html(text, search_query=search_query)
 
 
-def _normalize_language_to_iso(value: str | None) -> str | None:
-    """Return a 2-letter ISO code for a Whisper/Deepgram language string, or None.
+@st.cache_data(show_spinner=False)
+def _cached_reading_stats(text: str) -> dict:
+    return text_processor.get_reading_stats(text)
 
-    Accepts ISO codes ("fr", "fr-FR") and full names ("French"). Unknown values
-    return None so callers can fall back to displaying the raw string.
-    """
-    if not value:
-        return None
-    v = value.strip().lower()
-    if not v:
-        return None
-    # Strip locale suffix (e.g. "fr-FR" → "fr") and check ISO-2 form first.
-    head = v.split("-", 1)[0]
-    if len(head) == 2 and head.isalpha():
-        return head
-    return _LANGUAGE_NAME_TO_ISO.get(v)
+
+# Hard cap on uploaded file size (in bytes). Mirrors the
+# ``maxUploadSize = 2000`` (MB) value in .streamlit/config.toml — Streamlit
+# enforces it at the protocol layer for the upload widget, but the gate
+# here gives a clean app-level error if that setting is ever loosened or
+# bypassed and avoids ever writing a bigger temp file to disk.
+_MAX_UPLOAD_BYTES = 2000 * 1024 * 1024
 
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -152,721 +146,11 @@ except RuntimeError as _ffmpeg_err:
 
 # ── Custom CSS — "Studio Noir" Design System ─────────────────────────────────
 
-st.markdown("""
-<style>
-    /* ═══════════════════════════════════════════════════════════════════════
-       STUDIO NOIR — Production-Grade Design System
-       A sophisticated audio studio aesthetic with warm amber accents
-       ═══════════════════════════════════════════════════════════════════════ */
-
-    /* ── Google Fonts Import ─────────────────────────────────────────────── */
-    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Source+Sans+3:wght@300;400;500;600&display=swap');
-
-    /* ── CSS Variables ───────────────────────────────────────────────────── */
-    :root {
-        /* Core palette */
-        --noir-bg: #0a0a0c;
-        --noir-surface: #141418;
-        --noir-elevated: #1c1c22;
-        --noir-border: #2a2a32;
-        --noir-border-subtle: #1e1e24;
-
-        /* Warm amber accent (audio waveform inspired) */
-        --amber-50: #fffbeb;
-        --amber-100: #fef3c7;
-        --amber-200: #fde68a;
-        --amber-300: #fcd34d;
-        --amber-400: #fbbf24;
-        --amber-500: #f59e0b;
-        --amber-600: #d97706;
-
-        /* Text hierarchy */
-        --text-primary: #fafafa;
-        --text-secondary: #a1a1aa;
-        --text-muted: #71717a;
-
-        /* Accent gradient */
-        --gradient-amber: linear-gradient(135deg, #fbbf24 0%, #f59e0b 50%, #d97706 100%);
-        --gradient-amber-soft: linear-gradient(135deg, rgba(251,191,36,0.15) 0%, rgba(217,119,6,0.08) 100%);
-
-        /* Typography */
-        --font-display: 'Playfair Display', Georgia, serif;
-        --font-body: 'Source Sans 3', -apple-system, BlinkMacSystemFont, sans-serif;
-        --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
-
-        /* Spacing scale */
-        --space-xs: 0.25rem;
-        --space-sm: 0.5rem;
-        --space-md: 1rem;
-        --space-lg: 1.5rem;
-        --space-xl: 2rem;
-        --space-2xl: 3rem;
-
-        /* Shadows */
-        --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
-        --shadow-md: 0 4px 12px rgba(0,0,0,0.5);
-        --shadow-lg: 0 8px 32px rgba(0,0,0,0.6);
-        --shadow-glow: 0 0 20px rgba(251,191,36,0.15);
-
-        /* Transitions */
-        --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
-        --transition-smooth: 300ms cubic-bezier(0.4, 0, 0.2, 1);
-    }
-
-    /* ── Base Styles ─────────────────────────────────────────────────────── */
-    .stApp {
-        background: var(--noir-bg);
-        color: var(--text-primary);
-        font-family: var(--font-body);
-    }
-
-    /* Main container */
-    .main .block-container {
-        padding: var(--space-xl) var(--space-xl) var(--space-2xl);
-        max-width: 1200px;
-    }
-
-    /* ── Typography ──────────────────────────────────────────────────────── */
-    h1, h2, h3 {
-        font-family: var(--font-display);
-        letter-spacing: -0.02em;
-    }
-
-    h1 {
-        font-size: 2.75rem !important;
-        font-weight: 700 !important;
-        color: var(--text-primary) !important;
-        margin-bottom: 0 !important;
-        position: relative;
-        display: inline-block;
-    }
-
-    h2 {
-        font-size: 1.5rem !important;
-        font-weight: 600 !important;
-        color: var(--text-primary) !important;
-    }
-
-    h3 {
-        font-size: 1.25rem !important;
-        font-weight: 600 !important;
-        color: var(--text-primary) !important;
-    }
-
-    h4 {
-        font-family: var(--font-body);
-        font-size: 0.875rem !important;
-        font-weight: 600 !important;
-        color: var(--text-secondary) !important;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        margin-bottom: var(--space-md) !important;
-    }
-
-    p, span, label, .stMarkdown {
-        font-family: var(--font-body);
-        color: var(--text-secondary);
-        line-height: 1.6;
-    }
-
-    /* Custom subtitle class */
-    .studio-subtitle {
-        font-family: var(--font-body);
-        font-size: 1.125rem;
-        font-weight: 300;
-        color: var(--text-muted);
-        margin-top: -0.25rem;
-        margin-bottom: var(--space-xl);
-        letter-spacing: 0.02em;
-    }
-
-    /* ── Hero Section ────────────────────────────────────────────────────── */
-    .studio-hero {
-        position: relative;
-        padding: var(--space-lg) 0 var(--space-xl);
-        margin-bottom: var(--space-lg);
-    }
-
-    .studio-hero::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: -100px;
-        right: -100px;
-        height: 100%;
-        background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(251,191,36,0.08) 0%, transparent 70%);
-        pointer-events: none;
-    }
-
-    .studio-logo {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-md);
-    }
-
-    .studio-icon {
-        width: 48px;
-        height: 48px;
-        background: var(--gradient-amber);
-        border-radius: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 1.5rem;
-        box-shadow: var(--shadow-glow);
-    }
-
-    .studio-title {
-        font-family: var(--font-display);
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: var(--text-primary);
-        margin: 0;
-    }
-
-    .studio-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: rgba(251,191,36,0.1);
-        border: 1px solid rgba(251,191,36,0.2);
-        color: var(--amber-400);
-        font-family: var(--font-mono);
-        font-size: 0.7rem;
-        font-weight: 500;
-        padding: 4px 10px;
-        border-radius: 100px;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    /* ── Cards & Surfaces ────────────────────────────────────────────────── */
-    .studio-card {
-        background: var(--noir-surface);
-        border: 1px solid var(--noir-border);
-        border-radius: 16px;
-        padding: var(--space-lg);
-        transition: all var(--transition-smooth);
-    }
-
-    .studio-card:hover {
-        border-color: var(--noir-border);
-        box-shadow: var(--shadow-md);
-    }
-
-    .studio-card-elevated {
-        background: var(--noir-elevated);
-        border: 1px solid var(--noir-border);
-        border-radius: 16px;
-        padding: var(--space-lg);
-        box-shadow: var(--shadow-md);
-    }
-
-    /* Glass morphism card */
-    .studio-glass {
-        background: rgba(28,28,34,0.8);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 16px;
-        padding: var(--space-lg);
-    }
-
-    /* ── Upload Zone ─────────────────────────────────────────────────────── */
-    .studio-upload-zone {
-        background: linear-gradient(135deg, var(--noir-surface) 0%, var(--noir-elevated) 100%);
-        border: 2px dashed var(--noir-border);
-        border-radius: 20px;
-        padding: var(--space-xl);
-        text-align: center;
-        transition: all var(--transition-smooth);
-        position: relative;
-        overflow: hidden;
-    }
-
-    .studio-upload-zone::before {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: var(--gradient-amber-soft);
-        opacity: 0;
-        transition: opacity var(--transition-smooth);
-    }
-
-    .studio-upload-zone:hover {
-        border-color: var(--amber-500);
-    }
-
-    .studio-upload-zone:hover::before {
-        opacity: 1;
-    }
-
-    /* ── Metrics Display ─────────────────────────────────────────────────── */
-    .studio-metric {
-        background: var(--noir-surface);
-        border: 1px solid var(--noir-border-subtle);
-        border-radius: 12px;
-        padding: var(--space-md) var(--space-lg);
-        text-align: center;
-    }
-
-    .studio-metric-value {
-        font-family: var(--font-mono);
-        font-size: 1.25rem;
-        font-weight: 500;
-        color: var(--text-primary);
-        margin-bottom: 2px;
-    }
-
-    .studio-metric-label {
-        font-size: 0.75rem;
-        font-weight: 500;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-    }
-
-    /* ── Streamlit Metric Override ───────────────────────────────────────── */
-    [data-testid="stMetric"] {
-        background: var(--noir-surface);
-        border: 1px solid var(--noir-border-subtle);
-        border-radius: 12px;
-        padding: var(--space-md);
-    }
-
-    [data-testid="stMetricLabel"] {
-        font-family: var(--font-body);
-        font-size: 0.75rem !important;
-        font-weight: 500;
-        color: var(--text-muted) !important;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-    }
-
-    [data-testid="stMetricValue"] {
-        font-family: var(--font-mono) !important;
-        font-size: 1.25rem !important;
-        font-weight: 500;
-        color: var(--text-primary) !important;
-    }
-
-    /* ── Progress Bar ────────────────────────────────────────────────────── */
-    .stProgress > div > div {
-        background: var(--gradient-amber) !important;
-        border-radius: 100px;
-        box-shadow: var(--shadow-glow);
-    }
-
-    .stProgress > div {
-        background: var(--noir-surface) !important;
-        border-radius: 100px;
-    }
-
-    /* ── Sidebar ─────────────────────────────────────────────────────────── */
-    [data-testid="stSidebar"] {
-        background: var(--noir-surface);
-        border-right: 1px solid var(--noir-border-subtle);
-    }
-
-    [data-testid="stSidebar"] > div:first-child {
-        padding-top: var(--space-xl);
-    }
-
-    [data-testid="stSidebar"] h1,
-    [data-testid="stSidebar"] h2,
-    [data-testid="stSidebar"] h3 {
-        font-family: var(--font-display) !important;
-        color: var(--text-primary) !important;
-    }
-
-    [data-testid="stSidebar"] h2 {
-        font-size: 1.25rem !important;
-        margin-bottom: var(--space-lg) !important;
-    }
-
-    [data-testid="stSidebar"] h3 {
-        font-size: 0.875rem !important;
-        font-weight: 600 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--text-muted) !important;
-        margin-top: var(--space-lg) !important;
-        margin-bottom: var(--space-sm) !important;
-    }
-
-    [data-testid="stSidebar"] p,
-    [data-testid="stSidebar"] span,
-    [data-testid="stSidebar"] label {
-        color: var(--text-secondary) !important;
-    }
-
-    [data-testid="stSidebar"] .stCaption {
-        color: var(--text-muted) !important;
-        font-size: 0.8rem;
-    }
-
-    /* Sidebar section divider */
-    [data-testid="stSidebar"] hr {
-        border: none;
-        height: 1px;
-        background: var(--noir-border);
-        margin: var(--space-lg) 0;
-    }
-
-    /* ── Input Fields ────────────────────────────────────────────────────── */
-    .stTextInput > div > div > input,
-    .stTextArea textarea {
-        font-family: var(--font-mono) !important;
-        font-size: 0.9rem !important;
-        color: var(--text-primary) !important;
-        background: var(--noir-bg) !important;
-        border: 1px solid var(--noir-border) !important;
-        border-radius: 10px !important;
-        padding: var(--space-md) !important;
-        transition: all var(--transition-fast);
-    }
-
-    .stTextInput > div > div > input:focus,
-    .stTextArea textarea:focus {
-        border-color: var(--amber-500) !important;
-        box-shadow: 0 0 0 2px rgba(251,191,36,0.15) !important;
-    }
-
-    .stTextInput > div > div > input::placeholder,
-    .stTextArea textarea::placeholder {
-        color: var(--text-muted) !important;
-    }
-
-    /* Select boxes */
-    .stSelectbox > div > div {
-        background: var(--noir-bg) !important;
-        border: 1px solid var(--noir-border) !important;
-        border-radius: 10px !important;
-    }
-
-    .stSelectbox > div > div > div {
-        color: var(--text-primary) !important;
-    }
-
-    /* ── Buttons ─────────────────────────────────────────────────────────── */
-    .stButton > button {
-        font-family: var(--font-body);
-        font-weight: 600;
-        letter-spacing: 0.02em;
-        border-radius: 10px;
-        padding: 0.75rem 1.5rem;
-        transition: all var(--transition-fast);
-    }
-
-    /* Primary button */
-    .stButton > button[kind="primary"],
-    .stButton > button[data-testid="baseButton-primary"] {
-        background: var(--gradient-amber) !important;
-        color: var(--noir-bg) !important;
-        border: none !important;
-        box-shadow: var(--shadow-sm), var(--shadow-glow);
-    }
-
-    .stButton > button[kind="primary"]:hover,
-    .stButton > button[data-testid="baseButton-primary"]:hover {
-        transform: translateY(-1px);
-        box-shadow: var(--shadow-md), 0 0 30px rgba(251,191,36,0.25);
-    }
-
-    /* Secondary button */
-    .stButton > button[kind="secondary"],
-    .stButton > button[data-testid="baseButton-secondary"] {
-        background: transparent !important;
-        color: var(--text-primary) !important;
-        border: 1px solid var(--noir-border) !important;
-    }
-
-    .stButton > button[kind="secondary"]:hover,
-    .stButton > button[data-testid="baseButton-secondary"]:hover {
-        background: var(--noir-elevated) !important;
-        border-color: var(--amber-500) !important;
-        color: var(--amber-400) !important;
-    }
-
-    /* Download buttons */
-    .stDownloadButton > button {
-        font-family: var(--font-body) !important;
-        font-weight: 600 !important;
-        background: var(--noir-surface) !important;
-        color: var(--text-primary) !important;
-        border: 1px solid var(--noir-border) !important;
-        border-radius: 10px !important;
-        transition: all var(--transition-fast);
-    }
-
-    .stDownloadButton > button:hover {
-        background: var(--noir-elevated) !important;
-        border-color: var(--amber-500) !important;
-        color: var(--amber-400) !important;
-        box-shadow: var(--shadow-glow);
-    }
-
-    /* ── File Uploader ───────────────────────────────────────────────────── */
-    [data-testid="stFileUploader"] {
-        background: var(--noir-surface);
-        border: 2px dashed var(--noir-border);
-        border-radius: 16px;
-        padding: var(--space-lg);
-        transition: all var(--transition-smooth);
-    }
-
-    [data-testid="stFileUploader"]:hover {
-        border-color: var(--amber-500);
-        background: linear-gradient(135deg, var(--noir-surface) 0%, rgba(251,191,36,0.03) 100%);
-    }
-
-    [data-testid="stFileUploader"] section {
-        padding: var(--space-md);
-    }
-
-    [data-testid="stFileUploader"] button {
-        background: var(--gradient-amber) !important;
-        color: var(--noir-bg) !important;
-        font-weight: 600 !important;
-        border: none !important;
-        border-radius: 8px !important;
-    }
-
-    /* ── Expander ────────────────────────────────────────────────────────── */
-    .streamlit-expanderHeader {
-        font-family: var(--font-body) !important;
-        font-weight: 600 !important;
-        color: var(--text-primary) !important;
-        background: var(--noir-surface) !important;
-        border: 1px solid var(--noir-border) !important;
-        border-radius: 12px !important;
-        padding: var(--space-md) var(--space-lg) !important;
-    }
-
-    .streamlit-expanderContent {
-        background: var(--noir-surface) !important;
-        border: 1px solid var(--noir-border) !important;
-        border-top: none !important;
-        border-radius: 0 0 12px 12px !important;
-        padding: var(--space-lg) !important;
-    }
-
-    /* ── Checkbox & Radio ────────────────────────────────────────────────── */
-    .stCheckbox > label,
-    .stRadio > label {
-        color: var(--text-secondary) !important;
-    }
-
-    .stCheckbox > label > span:first-child,
-    .stRadio > label > div:first-child {
-        border-color: var(--noir-border) !important;
-    }
-
-    .stRadio > div {
-        gap: var(--space-md);
-    }
-
-    .stRadio > div > label {
-        background: var(--noir-surface) !important;
-        border: 1px solid var(--noir-border) !important;
-        border-radius: 8px !important;
-        padding: var(--space-sm) var(--space-md) !important;
-        transition: all var(--transition-fast);
-    }
-
-    .stRadio > div > label:hover {
-        border-color: var(--amber-500) !important;
-    }
-
-    .stRadio > div > label[data-checked="true"] {
-        background: rgba(251,191,36,0.1) !important;
-        border-color: var(--amber-500) !important;
-        color: var(--amber-400) !important;
-    }
-
-    /* ── Alerts ──────────────────────────────────────────────────────────── */
-    .stAlert {
-        border-radius: 12px !important;
-        border: none !important;
-    }
-
-    [data-testid="stNotification"] {
-        background: var(--noir-surface) !important;
-        border-left: 3px solid var(--amber-500) !important;
-        border-radius: 8px !important;
-    }
-
-    /* Success alert */
-    .stSuccess {
-        background: rgba(34,197,94,0.1) !important;
-        border-left: 3px solid #22c55e !important;
-    }
-
-    /* Info alert */
-    .stInfo {
-        background: rgba(59,130,246,0.1) !important;
-        border-left: 3px solid #3b82f6 !important;
-    }
-
-    /* Warning alert */
-    .stWarning {
-        background: rgba(251,191,36,0.1) !important;
-        border-left: 3px solid var(--amber-500) !important;
-    }
-
-    /* Error alert */
-    .stError {
-        background: rgba(239,68,68,0.1) !important;
-        border-left: 3px solid #ef4444 !important;
-    }
-
-    /* ── Divider ─────────────────────────────────────────────────────────── */
-    hr {
-        border: none !important;
-        height: 1px !important;
-        background: linear-gradient(90deg, transparent 0%, var(--noir-border) 20%, var(--noir-border) 80%, transparent 100%) !important;
-        margin: var(--space-xl) 0 !important;
-    }
-
-    /* ── Editor Preview Box ──────────────────────────────────────────────── */
-    .studio-preview {
-        background: var(--noir-bg);
-        border: 1px solid var(--noir-border);
-        border-radius: 12px;
-        padding: var(--space-lg);
-        max-height: 450px;
-        overflow-y: auto;
-        line-height: 1.9;
-        font-family: var(--font-body);
-        font-size: 1rem;
-        color: var(--text-secondary);
-    }
-
-    .studio-preview strong {
-        color: var(--amber-400);
-        font-weight: 600;
-    }
-
-    .studio-preview mark {
-        background: rgba(251,191,36,0.3);
-        color: var(--text-primary);
-        padding: 2px 4px;
-        border-radius: 4px;
-    }
-
-    /* ── Reading Stats ───────────────────────────────────────────────────── */
-    .studio-stats {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-lg);
-        font-family: var(--font-mono);
-        font-size: 0.8rem;
-        color: var(--text-muted);
-        padding: var(--space-sm) 0;
-    }
-
-    .studio-stats span {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-    }
-
-    /* ── Section Headers ─────────────────────────────────────────────────── */
-    .studio-section-header {
-        display: flex;
-        align-items: center;
-        gap: var(--space-md);
-        margin-bottom: var(--space-lg);
-    }
-
-    .studio-section-icon {
-        width: 32px;
-        height: 32px;
-        background: rgba(251,191,36,0.1);
-        border: 1px solid rgba(251,191,36,0.2);
-        border-radius: 8px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 1rem;
-    }
-
-    .studio-section-title {
-        font-family: var(--font-display);
-        font-size: 1.25rem;
-        font-weight: 600;
-        color: var(--text-primary);
-        margin: 0;
-    }
-
-    /* ── Caption Override ────────────────────────────────────────────────── */
-    .stCaption {
-        color: var(--text-muted) !important;
-        font-size: 0.85rem !important;
-    }
-
-    /* ── Scrollbar Styling ───────────────────────────────────────────────── */
-    ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-    }
-
-    ::-webkit-scrollbar-track {
-        background: var(--noir-bg);
-        border-radius: 4px;
-    }
-
-    ::-webkit-scrollbar-thumb {
-        background: var(--noir-border);
-        border-radius: 4px;
-    }
-
-    ::-webkit-scrollbar-thumb:hover {
-        background: var(--text-muted);
-    }
-
-    /* ── Animation Keyframes ─────────────────────────────────────────────── */
-    @keyframes pulse-glow {
-        0%, 100% { box-shadow: 0 0 15px rgba(251,191,36,0.2); }
-        50% { box-shadow: 0 0 25px rgba(251,191,36,0.35); }
-    }
-
-    @keyframes fade-in {
-        from { opacity: 0; transform: translateY(8px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-
-    .animate-fade-in {
-        animation: fade-in 0.4s ease-out forwards;
-    }
-
-    /* ── Waveform Decoration ─────────────────────────────────────────────── */
-    .studio-waveform {
-        display: flex;
-        align-items: center;
-        gap: 3px;
-        height: 24px;
-    }
-
-    .studio-waveform span {
-        width: 3px;
-        background: var(--amber-500);
-        border-radius: 2px;
-        animation: wave 1s ease-in-out infinite;
-    }
-
-    .studio-waveform span:nth-child(1) { height: 40%; animation-delay: 0s; }
-    .studio-waveform span:nth-child(2) { height: 70%; animation-delay: 0.1s; }
-    .studio-waveform span:nth-child(3) { height: 100%; animation-delay: 0.2s; }
-    .studio-waveform span:nth-child(4) { height: 60%; animation-delay: 0.3s; }
-    .studio-waveform span:nth-child(5) { height: 80%; animation-delay: 0.4s; }
-
-    @keyframes wave {
-        0%, 100% { transform: scaleY(1); }
-        50% { transform: scaleY(0.5); }
-    }
-</style>
-""", unsafe_allow_html=True)
+# CSS lives in assets/styles.css. Keeping ~700 lines of stylesheet
+# inside this Python file made app.py impractical to navigate and
+# excluded the styles from any CSS-aware tooling.
+_STYLES_PATH = Path(__file__).parent / "assets" / "styles.css"
+st.markdown(_STYLES_PATH.read_text(encoding="utf-8"), unsafe_allow_html=True)
 
 
 # ── Session state ────────────────────────────────────────────────────────────
@@ -1088,6 +372,17 @@ audio_file_path = None
 temp_upload_path = None
 
 if uploaded_file is not None:
+    # App-layer guard against oversize uploads. Belt-and-suspenders next
+    # to the protocol-level Streamlit cap — if that cap is ever loosened
+    # the user gets a clean error instead of an unbounded temp-file write.
+    if uploaded_file.size and uploaded_file.size > _MAX_UPLOAD_BYTES:
+        cap_mb = _MAX_UPLOAD_BYTES / (1024 * 1024)
+        size_mb = uploaded_file.size / (1024 * 1024)
+        st.error(
+            f"❌ File is too large ({size_mb:.0f} MB). The current limit is "
+            f"{cap_mb:.0f} MB."
+        )
+        st.stop()
     # Use cached temp file to avoid redundant writes on Streamlit re-runs
     audio_file_path = _get_cached_upload_path(uploaded_file)
     temp_upload_path = audio_file_path
@@ -1197,14 +492,30 @@ if audio_file_path:
             # the API actually heard (the classic "I picked German but the audio
             # is French → garbled output" trap).
             if detected_language:
-                detected_iso = _normalize_language_to_iso(detected_language)
+                detected_iso = normalize_language_to_iso(detected_language)
+                # Nova-3 multilingual returns "multi" — it handled multiple
+                # languages on purpose, so a single-language mismatch warning
+                # would always be a false positive there.
+                is_multi = detected_iso == MULTI_SENTINEL
+                # When the model returns a code we don't recognise, fall back
+                # to comparing the raw string so the warning still fires
+                # instead of silently disappearing.
+                effective_detected = detected_iso or detected_language.lower()
                 if not language_code:
-                    label = detected_iso.upper() if detected_iso else detected_language.upper()
-                    st.info(f"Detected language: **{label}**")
-                elif detected_iso and detected_iso != language_code:
+                    if is_multi:
+                        st.info("Detected language: **multiple (multilingual)**")
+                    else:
+                        label = (
+                            detected_iso.upper() if detected_iso else detected_language.upper()
+                        )
+                        st.info(f"Detected language: **{label}**")
+                elif not is_multi and effective_detected != language_code:
+                    display = (
+                        detected_iso.upper() if detected_iso else detected_language
+                    )
                     st.warning(
                         f"⚠️ You selected **{language_name}** but the audio sounds like "
-                        f"**{detected_iso.upper()}**. The transcript may be garbled. "
+                        f"**{display}**. The transcript may be garbled. "
                         "Re-run with Auto-detect, or pick the matching language."
                     )
 
@@ -1230,13 +541,20 @@ if audio_file_path:
             st.session_state.is_transcribing = False
             progress_bar.empty()
 
-            # Provide actionable error messages
-            error_msg = str(e)
-            if "401" in error_msg or "Unauthorized" in error_msg.lower() or "invalid api key" in error_msg.lower():
+            # Provide actionable error messages.
+            # ``error_msg`` is what the user sees on screen, so it goes
+            # through the redactor — provider SDK exceptions can embed
+            # the Authorization header verbatim. The branch matching uses
+            # the un-redacted lowercase string so legitimate "401" /
+            # "rate limit" / "timeout" markers still classify correctly.
+            raw_error = str(e)
+            error_msg_lower = raw_error.lower()
+            error_msg = cloud_engine.redact_secrets(raw_error)
+            if "401" in raw_error or "unauthorized" in error_msg_lower or "invalid api key" in error_msg_lower:
                 st.error("Invalid API key. Please check your API key in the sidebar.")
-            elif "429" in error_msg or "rate limit" in error_msg.lower():
+            elif "429" in raw_error or "rate limit" in error_msg_lower:
                 st.error("Rate limit exceeded. Please wait a moment and try again.")
-            elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+            elif "timeout" in error_msg_lower or "connection" in error_msg_lower:
                 st.error("Connection error. Please check your internet connection and try again.")
             else:
                 st.error(f"Transcription failed: {error_msg}")
@@ -1249,10 +567,10 @@ if audio_file_path:
             if chunk_paths:
                 audio_processor.cleanup_chunks(chunk_paths, audio_file_path)
 
-# Cleanup temp upload
-if temp_upload_path and os.path.exists(temp_upload_path):
-    # Don't delete yet — might still be needed for re-transcription
-    pass
+# Note: temp_upload_path is NOT cleaned up here — the user may re-run
+# transcription on the same file, and writing the upload again is the
+# expensive thing we're avoiding. _get_cached_upload_path() removes the
+# previous upload's temp file the next time a different file arrives.
 
 
 # ── Editor & Export ─────────────────────────────────────────────────────────
@@ -1348,9 +666,9 @@ if st.session_state.transcript:
     else:
         st.caption("Formatted preview. Switch to Edit mode to make changes.")
 
-        display_html = text_processor.render_transcript_html(
+        display_html = _cached_render_transcript_html(
             st.session_state.transcript,
-            search_query=search_query,
+            search_query,
         )
 
         # Render formatted preview
@@ -1363,7 +681,7 @@ if st.session_state.transcript:
         edited_text = st.session_state.transcript
 
     # Reading stats
-    stats = text_processor.get_reading_stats(edited_text)
+    stats = _cached_reading_stats(edited_text)
     reading_time = stats["reading_time_minutes"]
     if reading_time < 1:
         time_str = f"{int(reading_time * 60)}s read"

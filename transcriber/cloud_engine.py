@@ -29,6 +29,35 @@ class NonRetriableAPIError(Exception):
     pass
 
 
+# Patterns for things that look like an API key or bearer token. Provider
+# SDK exceptions sometimes embed the failing request in their string repr,
+# which can include the Authorization header — so any exception we surface
+# to the UI must run through this redactor first.
+_SECRET_PATTERNS = (
+    re.compile(r"Bearer\s+\S+", re.IGNORECASE),
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"\b(?:gsk|dg|ds|tk)_[A-Za-z0-9_\-]{16,}\b"),
+    re.compile(r'(?i)(?:api[_-]?key|authorization|token)["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-\.]{16,})'),
+)
+
+
+def redact_secrets(message: str) -> str:
+    """Strip anything that looks like a credential from a string.
+
+    Provider SDK exceptions occasionally embed the outgoing Authorization
+    header in their repr (we've observed this on malformed-key 401s from
+    the OpenAI client). Anything routed to ``st.error``/``st.warning`` —
+    and therefore visible on a user's screen — must run through here so
+    that a screenshot of an error doesn't leak the user's key.
+    """
+    if not message:
+        return message
+    redacted = message
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
 def _is_retriable_error(exc: BaseException) -> bool:
     """
     Determine if an exception is retriable based on HTTP status code.
@@ -269,7 +298,7 @@ def transcribe_chunks(
             )
             failed_chunks.append(i)
             quality_warnings.append(
-                f"Chunk {i + 1} failed and was skipped: {exc}"
+                f"Chunk {i + 1} failed and was skipped: {redact_secrets(str(exc))}"
             )
 
         chunk_elapsed = time.monotonic() - chunk_start
@@ -563,84 +592,94 @@ def _transcribe_deepgram(
     by using word-level speaker assignments to find speaker change boundaries, then
     extracting the corresponding text from the formatted transcript.
     """
-    try:
-        # Read file into memory for the Deepgram v5+ SDK
-        with open(file_path, "rb") as audio_file:
-            audio_data = audio_file.read()
+    # Build keyword arguments for v5+ SDK
+    kwargs = {
+        "model": model,
+        "smart_format": True,
+        "punctuate": True,
+        "diarize": diarize,
+        "paragraphs": True,
+    }
 
-        # Build keyword arguments for v5+ SDK
-        kwargs = {
-            "model": model,
-            "smart_format": True,
-            "punctuate": True,
-            "diarize": diarize,
-            "paragraphs": True,
-        }
+    # Handle language settings
+    if is_multilingual:
+        # Nova-3 multilingual mode: "multi" handles code-switching automatically
+        kwargs["language"] = "multi"
+    elif language and language != "auto":
+        # Honour the user's forced language but still ask Deepgram to report
+        # what it detected — without this, ``metadata.detected_language``
+        # comes back ``None`` and the UI's mismatch warning can never fire,
+        # so a wrong forced-language selection silently produces garbled
+        # output. The provider docs allow combining the two: forced language
+        # wins for the actual transcription, detection is reported in metadata.
+        kwargs["language"] = language
+        kwargs["detect_language"] = True
+    else:
+        # Auto-detect: CRITICAL - without this Deepgram defaults to English
+        # and transcribes German/French audio as garbled phonemes
+        kwargs["detect_language"] = True
 
-        # Handle language settings
-        if is_multilingual:
-            # Nova-3 multilingual mode: "multi" handles code-switching automatically
-            kwargs["language"] = "multi"
-        elif language and language != "auto":
-            kwargs["language"] = language
-        else:
-            # Auto-detect: CRITICAL - without this Deepgram defaults to English
-            # and transcribes German/French audio as garbled phonemes
-            kwargs["detect_language"] = True
-
+    # Stream the file handle directly to the SDK rather than slurping the
+    # whole file into RAM with ``read()`` — for a 500 MB chunk that
+    # eliminated up to half a gigabyte of unnecessary allocation per call.
+    # The SDK accepts a ``BufferedReader`` for ``transcribe_file``.
+    with open(file_path, "rb") as audio_file:
+        # Bare ``except`` was previously wrapping every SDK exception in a
+        # generic RuntimeError. That defeated the @retry decorator's
+        # isinstance-based predicate and meant typed Deepgram errors
+        # (NonRetriable, etc.) lost their type before retry inspection.
+        # Letting the original exceptions propagate keeps the smart-retry
+        # logic working as intended.
         response = client.listen.v1.media.transcribe_file(
-            request=audio_data,
+            request=audio_file,
             **kwargs,
         )
 
-        # Parse response with null safety checks
-        if not response or not response.results:
-            return {"text": "", "detected_language": None}
+    # Parse response with null safety checks
+    if not response or not response.results:
+        return {"text": "", "detected_language": None}
 
-        channels = getattr(response.results, "channels", None)
-        if not channels or len(channels) == 0:
-            return {"text": "", "detected_language": None}
+    channels = getattr(response.results, "channels", None)
+    if not channels or len(channels) == 0:
+        return {"text": "", "detected_language": None}
 
-        channel = channels[0]
-        if not channel:
-            return {"text": "", "detected_language": None}
+    channel = channels[0]
+    if not channel:
+        return {"text": "", "detected_language": None}
 
-        alternatives = getattr(channel, "alternatives", None)
-        if not alternatives or len(alternatives) == 0:
-            return {"text": "", "detected_language": None}
+    alternatives = getattr(channel, "alternatives", None)
+    if not alternatives or len(alternatives) == 0:
+        return {"text": "", "detected_language": None}
 
-        alternative = alternatives[0]
-        if not alternative:
-            return {"text": "", "detected_language": None}
+    alternative = alternatives[0]
+    if not alternative:
+        return {"text": "", "detected_language": None}
 
-        # Extract the detected language from metadata if available
-        detected_language: str | None = None
-        metadata = getattr(response, "metadata", None)
-        if metadata:
-            detected_language = getattr(metadata, "detected_language", None)
+    # Extract the detected language from metadata if available
+    detected_language: str | None = None
+    metadata = getattr(response, "metadata", None)
+    if metadata:
+        detected_language = getattr(metadata, "detected_language", None)
 
-        # Get the fully formatted transcript (with punctuation, smart formatting)
-        full_transcript = getattr(alternative, "transcript", None) or ""
+    # Get the fully formatted transcript (with punctuation, smart formatting)
+    full_transcript = getattr(alternative, "transcript", None) or ""
 
-        if diarize:
-            # Prefer Deepgram's structured `paragraphs` output: it already
-            # carries speaker IDs, smart-format punctuation, and
-            # natural-pause paragraph boundaries, so we don't have to rebuild
-            # any of that from raw word timestamps.
-            text = _format_diarized_from_paragraphs(alternative)
-            if text is None:
-                # Fall back to walking words[] for older models or responses
-                # that don't include a paragraphs object.
-                text = _format_diarized_from_words(alternative)
-            if not text:
-                # Ultimate fallback: the unformatted full transcript.
-                text = full_transcript
-            return {"text": text, "detected_language": detected_language}
-        else:
-            return {"text": full_transcript, "detected_language": detected_language}
-
-    except Exception as exc:
-        raise RuntimeError(f"Deepgram error: {exc}") from exc
+    if diarize:
+        # Prefer Deepgram's structured `paragraphs` output: it already
+        # carries speaker IDs, smart-format punctuation, and
+        # natural-pause paragraph boundaries, so we don't have to rebuild
+        # any of that from raw word timestamps.
+        text = _format_diarized_from_paragraphs(alternative)
+        if text is None:
+            # Fall back to walking words[] for older models or responses
+            # that don't include a paragraphs object.
+            text = _format_diarized_from_words(alternative)
+        if not text:
+            # Ultimate fallback: the unformatted full transcript.
+            text = full_transcript
+        return {"text": text, "detected_language": detected_language}
+    else:
+        return {"text": full_transcript, "detected_language": detected_language}
 
 
 def _format_diarized_from_paragraphs(alternative) -> str | None:
