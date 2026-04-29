@@ -28,6 +28,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 - **Filler word highlighting** — Marks um, uh, äh, euh, like, basically in italic for easy review (English, German, French)
 - **Search & highlight** — Find and highlight any word or phrase in the preview
 - **Timestamps** — Optional `[HH:MM:SS]` markers at every paragraph and speaker change, rendered in the editor and embedded in DOCX/PDF exports
+- **Confidence highlighting** — Optional amber highlight on words Deepgram was least sure of, so manual review focuses on the parts that actually need it (Deepgram only)
 
 ### Editor
 - **Edit / Preview modes** — Toggle between raw text editing and a formatted visual preview
@@ -95,6 +96,14 @@ Under **Spoken Language**, choose:
 - **A specific language** — set explicitly for best accuracy on single-language files. The dropdown covers 30+ languages including Arabic, Chinese, Dutch, German, Hindi, Japanese, Korean, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian, and Vietnamese.
 
 > **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 (Multilingual)** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
+
+---
+
+### 3b. Highlight Low-Confidence Words (Optional, Deepgram only)
+
+Tick **Highlight low-confidence words** in the sidebar (Deepgram providers only). Deepgram returns a per-word confidence score; words at or below the threshold (default 0.6, adjustable via the slider) are wrapped in `~~word~~` markers and rendered with an amber highlight in the editor preview and a yellow text-highlight in the DOCX export. PDF export strips the markers cleanly. Use this as a guide for manual review — the highlighted words are the ones the model was least sure of.
+
+This requires per-word data, so transcripts are built from Deepgram's word list (the smart-formatted `paragraphs` shortcut is bypassed). Smart-format niceties like "two thousand twenty" → "2020" are not applied in this mode.
 
 ---
 

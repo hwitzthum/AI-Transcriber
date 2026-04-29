@@ -30,6 +30,13 @@ _SPEAKER_LABEL_PATTERN = re.compile(r'\*\*Speaker (\d+):\*\*')
 # bracketed content inside the speaker text.
 _TIMESTAMP_MARKER_PATTERN = re.compile(r'\[(\d{2}:\d{2}:\d{2})\]')
 
+# Inline ``~~word~~`` markers wrap low-confidence words from Deepgram.
+# Same shape as the filler-word ``_word_`` convention; the renderer
+# styles them in amber and exports strip them. Constraining to one
+# line and rejecting tildes in the body avoids accidental matches in
+# transcripts that happen to contain a literal tilde character.
+_LOW_CONFIDENCE_PATTERN = re.compile(r'~~([^~\n]+?)~~')
+
 
 def highlight_filler_words(text: str) -> str:
     """
@@ -111,6 +118,15 @@ def render_transcript_html(text: str, search_query: Optional[str] = None) -> str
     if search_query and search_query.strip():
         escaped = search_and_highlight(escaped, search_query)
 
+    # Low-confidence wrap runs first so its inner text is still
+    # available to the bold/italic passes below — that way a word that
+    # is BOTH a filler and low-confidence (e.g. a Deepgram-uncertain
+    # "um") gets both the amber background and the gray italic.
+    escaped = _LOW_CONFIDENCE_PATTERN.sub(
+        r'<span style="background: #fef3c7; '
+        r'border-bottom: 1px dotted #b45309; padding: 0 1px;">\1</span>',
+        escaped,
+    )
     # Bold: **text** → <strong>text</strong> (non-greedy, paired markers).
     escaped = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', escaped)
     # Italic: _text_ → <em>text</em>. Paired underscores only, no newline
@@ -165,14 +181,14 @@ def get_reading_stats(text: str) -> dict:
     Returns:
         Dictionary with word_count, char_count, reading_time_minutes.
     """
-    # Remove markdown formatting and timestamp markers for an accurate count.
-    # Timestamps are inserted by the timestamped-transcript path; without
-    # this strip they'd inflate the word count by one per paragraph and
-    # the character count by ten per paragraph.
+    # Remove markdown formatting, timestamp markers, and low-confidence
+    # wraps for an accurate count. Without these strips, the marker
+    # tokens would inflate both the word count and the character count.
     plain_text = _TIMESTAMP_MARKER_PATTERN.sub('', text)
+    plain_text = _LOW_CONFIDENCE_PATTERN.sub(r'\1', plain_text)
     plain_text = re.sub(r'\*\*[^*]+\*\*', '', plain_text)  # Remove bold
     plain_text = re.sub(r'_[^_]+_', '', plain_text)  # Remove italic
-    plain_text = plain_text.replace("**", "").replace("_", "")
+    plain_text = plain_text.replace("**", "").replace("_", "").replace("~~", "")
 
     words = plain_text.split()
     word_count = len(words)

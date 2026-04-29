@@ -10,14 +10,20 @@ from typing import Optional, Tuple, List
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_COLOR_INDEX
 from fpdf import FPDF
 
 
-# Regex to match filler words marked with underscores like _um_ or _uh_.
-# Speaker labels are parsed by ``_parse_speaker_block`` using a broader
-# pattern that handles renamed speakers too — there is no separate
-# Speaker-only regex here on purpose.
+# Inline markers the transcript pipeline can emit. Both ``_filler_`` and
+# ``~~low-confidence~~`` are rendered into the formatted segment list
+# below; ``_strip_inline_markers`` peels them off when an export path
+# can't represent the styling (e.g. PDF body text).
 _FILLER_PATTERN = re.compile(r"_([^_]+)_")
+_LOW_CONFIDENCE_PATTERN = re.compile(r"~~([^~]+)~~")
+# Combined pattern: matches ``~~text~~`` (group 1) OR ``_text_``
+# (group 2). Used by the segment splitter so a single pass handles
+# both marker shapes in source order.
+_INLINE_MARKER_PATTERN = re.compile(r"~~([^~\n]+?)~~|_([^_\n]+?)_")
 
 # Leading ``[HH:MM:SS]`` marker stripped off before we look for the
 # speaker label. Same shape the timestamped-transcript pipeline emits.
@@ -143,63 +149,67 @@ def _parse_speaker_block(block: str) -> Tuple[Optional[str], Optional[str], str]
     return timestamp, None, stripped
 
 
-def _parse_text_segments(text: str) -> List[Tuple[str, bool]]:
+def _parse_text_segments(text: str) -> List[Tuple[str, Optional[str]]]:
     """
-    Parse text into segments, identifying filler words marked with underscores.
+    Parse text into ``(text, kind)`` segments where ``kind`` is one of
+    ``"filler"``, ``"low_confidence"``, or ``None`` (unstyled).
 
-    Args:
-        text: Text that may contain _filler_ markers.
-
-    Returns:
-        List of tuples (text, is_filler) where is_filler indicates if the
-        segment is a filler word that should be styled differently.
+    Iterating over the combined pattern (rather than running two passes,
+    one per marker type) preserves source order, so when the renderer
+    walks the result a span like ``"_um_ ~~probably~~"`` produces an
+    italic-gray run followed by an amber-highlighted run in that order.
     """
-    segments = []
+    segments: List[Tuple[str, Optional[str]]] = []
     last_end = 0
 
-    for match in _FILLER_PATTERN.finditer(text):
-        # Add text before the filler
+    for match in _INLINE_MARKER_PATTERN.finditer(text):
         if match.start() > last_end:
-            segments.append((text[last_end:match.start()], False))
-        # Add the filler word (without underscores)
-        segments.append((match.group(1), True))
+            segments.append((text[last_end:match.start()], None))
+
+        if match.group(1) is not None:
+            segments.append((match.group(1), "low_confidence"))
+        else:
+            segments.append((match.group(2), "filler"))
+
         last_end = match.end()
 
-    # Add remaining text after last filler
     if last_end < len(text):
-        segments.append((text[last_end:], False))
+        segments.append((text[last_end:], None))
 
-    return segments if segments else [(text, False)]
+    return segments if segments else [(text, None)]
 
 
 def _add_formatted_text_to_paragraph(para, text: str) -> None:
     """
-    Add text to a DOCX paragraph with filler words styled as italic gray.
+    Add text to a DOCX paragraph with filler / low-confidence styling.
 
-    Args:
-        para: A python-docx paragraph object.
-        text: Text that may contain _filler_ markers.
+    Filler words render as italic gray (matches the editor preview).
+    Low-confidence words get a yellow text highlight so a reviewer can
+    spot what to verify without reading the whole transcript.
     """
     segments = _parse_text_segments(text)
 
-    for segment_text, is_filler in segments:
+    for segment_text, kind in segments:
         run = para.add_run(segment_text)
-        if is_filler:
+        if kind == "filler":
             run.italic = True
-            run.font.color.rgb = RGBColor(0x9c, 0xa3, 0xaf)  # Gray color for fillers
+            run.font.color.rgb = RGBColor(0x9c, 0xa3, 0xaf)
+        elif kind == "low_confidence":
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
 
 
-def _strip_filler_markers(text: str) -> str:
+def _strip_inline_markers(text: str) -> str:
     """
-    Remove filler word underscore markers, keeping the words.
-
-    Args:
-        text: Text that may contain _filler_ markers.
-
-    Returns:
-        Text with markers removed (e.g., "_um_" -> "um").
+    Remove ``_filler_`` AND ``~~low-confidence~~`` markers from a string,
+    keeping the words. Used by the PDF export, where the body-text
+    renderer can't apply per-run styling without a major restructure —
+    so the cleaner option is to drop the markers and produce a plain
+    transcript that's still readable. The inline visual cues are
+    available in the editor preview and the DOCX export.
     """
-    return _FILLER_PATTERN.sub(r"\1", text)
+    cleaned = _FILLER_PATTERN.sub(r"\1", text)
+    cleaned = _LOW_CONFIDENCE_PATTERN.sub(r"\1", cleaned)
+    return cleaned
 
 
 def export_docx(text: str, title: str = "Transcription") -> bytes:
@@ -367,7 +377,7 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
                 pdf.set_font(body_font, "", 11)
                 pdf.set_text_color(51, 51, 51)
                 pdf.set_x(pdf.l_margin + 5)  # Slight indent
-                pdf.multi_cell(0, 6, _strip_filler_markers(content))
+                pdf.multi_cell(0, 6, _strip_inline_markers(content))
             pdf.ln(6)
         else:
             # Plain paragraph; same muted-timestamp treatment as above.
@@ -378,7 +388,7 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
 
             pdf.set_font(body_font, "", 11)
             pdf.set_text_color(51, 51, 51)
-            pdf.multi_cell(0, 6, _strip_filler_markers(content))
+            pdf.multi_cell(0, 6, _strip_inline_markers(content))
             pdf.ln(4)
 
     # Output as bytes - handle bytes, bytearray, and string return types from fpdf2
