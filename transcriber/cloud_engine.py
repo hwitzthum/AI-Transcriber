@@ -3,6 +3,8 @@
 import logging
 import re
 import time
+from collections import Counter
+
 from openai import OpenAI
 from groq import Groq
 from deepgram import DeepgramClient
@@ -17,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 # HTTP status codes that are retriable (transient server errors)
 _RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# HTTP status codes that should never be retried (caller error / auth /
+# resource-missing). Kept at module scope alongside the retriable set so
+# both lists are visible together and we don't reallocate the tuple on
+# every retry-predicate invocation.
+_NON_RETRIABLE_CODES = (400, 401, 403, 404)
 
 
 class RetriableAPIError(Exception):
@@ -83,7 +91,6 @@ def _is_retriable_error(exc: BaseException) -> bool:
     # that an embedded substring like "400" inside a larger number (e.g.
     # "14002") never falsely classifies as retriable. Use \b to anchor on
     # whole numeric tokens.
-    _NON_RETRIABLE_CODES = (400, 401, 403, 404)
     for code in _NON_RETRIABLE_CODES:
         if re.search(rf"\b{code}\b", exc_str_raw):
             return False
@@ -203,6 +210,16 @@ _MIN_WORDS_PER_CHUNK = 3
 # How many words from the end of the previous chunk to compare against when
 # deduplicating overlap regions. Larger window = safer but slower.
 _DEDUP_WINDOW_WORDS = 40
+
+# Strip leading/trailing non-word chars from a token before overlap comparison.
+# Pre-compiled and module-level so _find_overlap_length doesn't re-create it
+# per call.
+_WORD_EDGE_PUNCT = re.compile(r"^[^\w]+|[^\w]+$")
+
+
+def _norm_word(w: str) -> str:
+    """Lowercase a word and strip punctuation from its edges."""
+    return _WORD_EDGE_PUNCT.sub("", w.lower())
 
 
 def transcribe_chunks(
@@ -415,11 +432,8 @@ def _find_overlap_length(tail_words: list[str], curr_words: list[str]) -> int:
     max_possible = min(len(tail_words), len(curr_words))
 
     # Normalise for comparison: lowercase, strip punctuation from word edges
-    def _norm(w: str) -> str:
-        return re.sub(r"^[^\w]+|[^\w]+$", "", w.lower())
-
-    tail_norm = [_norm(w) for w in tail_words]
-    curr_norm = [_norm(w) for w in curr_words]
+    tail_norm = [_norm_word(w) for w in tail_words]
+    curr_norm = [_norm_word(w) for w in curr_words]
 
     # Try the longest possible overlap first (greedy)
     for length in range(max_possible, min_overlap - 1, -1):
@@ -447,7 +461,6 @@ def _looks_like_garbage(text: str) -> bool:
 
     # Check for extreme word repetition: if the top word accounts for more than
     # 30% of all words, something is likely wrong.
-    from collections import Counter
     counts = Counter(w.lower().strip(".,!?;:\"'") for w in words)
     most_common_word, most_common_count = counts.most_common(1)[0]
     if most_common_count / len(words) > 0.30:
