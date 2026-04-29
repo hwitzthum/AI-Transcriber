@@ -7,7 +7,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 ## Features
 
 ### Transcription
-- **Multiple cloud providers** — OpenAI Whisper API, Groq, Deepgram Nova-2, Deepgram Nova-3 Multilingual
+- **Multiple cloud providers** — OpenAI Whisper API, Groq, Deepgram Nova-2, Deepgram Nova-3 (Multilingual)
 - **Multilingual support** — Auto-detect or select a language; Nova-3 handles code-switching (German/French in the same recording)
 - **Speaker diarization** — Identifies individual speakers (Deepgram only)
 - **Large file support** — Automatic chunking and memory-efficient streaming for files of any size
@@ -80,7 +80,7 @@ Open the **sidebar** (left panel). Select a transcription provider:
 | **OpenAI Whisper API** | General accuracy | ~$0.006/min |
 | **Groq (whisper-large-v3-turbo)** | Speed, low cost | Free tier available |
 | **Deepgram Nova-2** | Speaker identification | Pay-as-you-go |
-| **Deepgram Nova-3 Multilingual** | Mixed German/French audio | Pay-as-you-go |
+| **Deepgram Nova-3 (Multilingual)** | Mixed German/French audio | Pay-as-you-go |
 
 Paste your API key into the **API Key** field. Keys are session-only and never stored.
 
@@ -92,7 +92,7 @@ Under **Language**, choose:
 - **Auto-detect** — the API identifies the language automatically
 - **German / French / English** — set explicitly for best accuracy on single-language files
 
-> **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 Multilingual** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
+> **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 (Multilingual)** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
 
 ---
 
@@ -134,8 +134,11 @@ A progress bar and live status show which chunk is being processed, plus an esti
 
 When complete:
 - A detected language notice appears if Auto-detect was used
+- If you forced a specific language and the API detected a different one, a warning is shown so you can re-run with Auto-detect or pick the matching language — this prevents the "garbled output because the wrong language was forced" failure mode
 - Any failed chunks or quality warnings are shown
 - 🎉 Balloons appear on success
+
+> **Note:** Transcripts are produced in the spoken language of the audio. The app does not translate — choose Auto-detect or the actual spoken language, not your preferred output language.
 
 ---
 
@@ -189,15 +192,20 @@ Both formats include:
 ```
 Transcriber/
 ├── app.py                   # Streamlit entry point and UI
+├── assets/
+│   └── styles.css           # "Studio Noir" stylesheet (loaded by app.py)
 ├── transcriber/
 │   ├── __init__.py
 │   ├── audio_processor.py   # Format conversion, chunking, ffprobe metadata
 │   ├── cloud_engine.py      # OpenAI / Groq / Deepgram API, retry logic, deduplication
 │   ├── exporter.py          # DOCX and PDF export with speaker formatting
+│   ├── language.py          # ISO-639-1 normalization for detected languages
 │   └── text_processor.py    # Filler detection, speaker renaming, search highlight
 ├── tests/
 │   ├── test_all.py          # Core test suite (audio, chunking, export)
-│   └── test_cloud_engine.py # Cloud engine unit tests (retry, dedup, garbage detection)
+│   ├── test_cloud_engine.py # Cloud engine unit tests (retry, dedup, garbage detection)
+│   ├── test_language.py     # Language code normalization
+│   └── test_text_processor.py
 ├── pyproject.toml
 └── README.md
 ```
@@ -207,8 +215,7 @@ Transcriber/
 ## Running Tests
 
 ```bash
-uv run python tests/test_all.py
-uv run python tests/test_cloud_engine.py
+uv run pytest tests/
 ```
 
 All tests are offline — no API keys required.
@@ -220,6 +227,8 @@ All tests are offline — no API keys required.
 | Problem | Solution |
 |---|---|
 | Transcript is in English even though audio is German | Make sure **Auto-detect** is selected and you are using Deepgram, not OpenAI/Groq |
+| You forced a language but the transcript looks garbled | The app shows a warning when the API detected a different language than the one you forced — re-run with Auto-detect or pick the matching language |
+| The transcript came back in English but the audio is German/French | The app does not translate — it transcribes in the spoken language. Choose Auto-detect or the actual language, not the language you want the output in |
 | PDF shows `?` for ü/ä/ö/œ | Arial Unicode must be installed — on macOS it lives in `/System/Library/Fonts/Supplemental/` |
 | Transcription fails immediately | Check your API key — invalid keys are rejected without retrying |
 | Large file runs out of memory | The app streams files through ffmpeg without loading them into RAM; ensure ffmpeg is installed and on `PATH` |

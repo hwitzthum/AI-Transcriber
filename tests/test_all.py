@@ -308,58 +308,8 @@ def test_format_conversion():
     print("\n  ✅ Format conversion PASSED")
 
 
-if __name__ == "__main__":
-    print("\n" + "🧪" * 30)
-    print("  TRANSCRIBER — CLOUD-ONLY TEST SUITE")
-    print("🧪" * 30)
-    
-    all_passed = True
-    results = {}
-    
-    tests = [
-        ("Audio Validation", test_audio_validation),
-        ("Audio Metadata", test_audio_info),
-        ("Chunking Logic", test_chunking_logic),
-        ("Format Conversion", test_format_conversion),
-        ("Video Optimization", test_video_audio_extraction),
-    ]
-    
-    # Note: Cloud API integration tests require real API keys.
-    # Unit tests for retry logic, deduplication, etc. are below.
-    
-    for name, test_fn in tests:
-        try:
-            result = test_fn()
-            results[name] = "✅ PASSED"
-        except Exception as e:
-            results[name] = f"❌ FAILED: {e}"
-            all_passed = False
-            import traceback
-            traceback.print_exc()
-    
-    # Export tests
-    export_text = "This is a placeholder text for export testing, as we skipped transcription."
-    
-    for name, test_fn in [("DOCX Export", test_docx_export), ("PDF Export", test_pdf_export)]:
-        try:
-            test_fn(export_text)
-            results[name] = "✅ PASSED"
-        except Exception as e:
-            results[name] = f"❌ FAILED: {e}"
-            all_passed = False
-            import traceback
-            traceback.print_exc()
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("  TEST SUMMARY")
-    print("=" * 60)
-    for name, result in results.items():
-        print(f"  {result}  {name}")
-    
-    print(f"\n{'='*60}")
-    if all_passed:
-        print("  🎉 ALL TESTS PASSED!")
-    else:
-        print("  ⚠️  SOME TESTS FAILED — see above for details")
-    print(f"{'='*60}\n")
+# Run with: uv run pytest tests/
+# The previous __main__ block bypassed pytest fixture injection and
+# called fixture-decorated tests directly with positional strings,
+# masking real fixture errors. Pytest discovery is the single source
+# of truth for what gets executed.

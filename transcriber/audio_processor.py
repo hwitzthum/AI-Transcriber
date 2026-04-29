@@ -294,8 +294,15 @@ def _get_duration_seconds(file_path: str) -> float:
     try:
         return float(result.stdout.strip())
     except ValueError:
+        # ffprobe stderr can echo the resolved input path or, on some
+        # builds, codec-search paths from the environment. Cap the snippet
+        # before surfacing it to the UI and drop ``file_path`` from the
+        # message — the path is already in the logger call (with full
+        # context) so it isn't lost.
+        stderr_snippet = (result.stderr or "").strip()[:200]
+        logger.error("ffprobe failed for %s: %s", file_path, stderr_snippet)
         raise RuntimeError(
-            f"ffprobe could not determine duration of {file_path}: {result.stderr.strip()}"
+            f"ffprobe could not determine audio duration: {stderr_snippet}"
         )
 
 
@@ -337,11 +344,17 @@ def _chunk_with_ffmpeg(
         num_chunks,
     )
 
+    # Tail chunks shorter than this produce ffmpeg outputs of a few
+    # milliseconds — the API transcribes them as silence and the quality
+    # warning fires on every multi-chunk run. Half a second is well below
+    # any meaningful speech segment.
+    MIN_CHUNK_SEC = 0.5
+
     for i in range(num_chunks):
         start_sec = i * step_sec
         # Do not exceed file duration
         actual_duration_sec = min(chunk_duration_sec, total_seconds - start_sec)
-        if actual_duration_sec <= 0:
+        if actual_duration_sec < MIN_CHUNK_SEC:
             break
 
         with tempfile.NamedTemporaryFile(
@@ -350,6 +363,12 @@ def _chunk_with_ffmpeg(
             dir=tempfile.gettempdir(),
         ) as tmp:
             out_path = tmp.name
+
+        # Track the temp file BEFORE running ffmpeg so the caller's
+        # ``cleanup_chunks`` finally handler can remove it even when
+        # this chunk is the one that fails. Previously the append
+        # happened only on success, leaking the failing chunk's file.
+        chunk_paths.append(out_path)
 
         cmd = [
             "ffmpeg",
@@ -378,8 +397,6 @@ def _chunk_with_ffmpeg(
             raise RuntimeError(
                 f"ffmpeg failed on chunk {i + 1}: {stderr_snippet}"
             ) from exc
-
-        chunk_paths.append(out_path)
 
         if progress_callback:
             progress_callback(i + 1, num_chunks, f"Splitting audio: chunk {i + 1}/{num_chunks}")
@@ -421,7 +438,26 @@ def _ensure_mp3(file_path: str) -> str:
         "-ac", "1",
         out_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # 5 minutes is the same ceiling used by the chunking path. Without
+    # any timeout, a corrupted input or a stalled filesystem could hang
+    # the Streamlit thread indefinitely with no diagnostic.
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if os.path.exists(out_path):
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+        raise RuntimeError(
+            "ffmpeg transcode timed out after 300 s — the input file may be corrupted."
+        ) from exc
+
     if result.returncode != 0:
         if os.path.exists(out_path):
             try:
