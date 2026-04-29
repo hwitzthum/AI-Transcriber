@@ -8,7 +8,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 
 ### Transcription
 - **Multiple cloud providers** — OpenAI Whisper API, Groq, Deepgram Nova-2, Deepgram Nova-3 (Multilingual)
-- **Multilingual support** — Auto-detect or select a language; Nova-3 handles code-switching (German/French in the same recording)
+- **Multilingual support** — Auto-detect or pick from 30+ languages (English, German, French, Spanish, Italian, Portuguese, Dutch, Polish, Russian, Japanese, Chinese, Korean, Arabic, Hindi, Turkish, and more); Nova-3 handles code-switching within the same recording
 - **Speaker diarization** — Identifies individual speakers (Deepgram only)
 - **Large file support** — Automatic chunking and memory-efficient streaming for files of any size
 - **Video support** — Extracts audio from MP4, MOV, AVI, MKV, and more
@@ -90,7 +90,7 @@ Paste your API key into the **API Key** field. Keys are session-only and never s
 
 Under **Spoken Language**, choose:
 - **Auto-detect** — the API identifies the language automatically
-- **German / French / English** — set explicitly for best accuracy on single-language files
+- **A specific language** — set explicitly for best accuracy on single-language files. The dropdown covers 30+ languages including Arabic, Chinese, Dutch, German, Hindi, Japanese, Korean, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian, and Vietnamese.
 
 > **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 (Multilingual)** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
 

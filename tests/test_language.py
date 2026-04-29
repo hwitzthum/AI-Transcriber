@@ -50,6 +50,24 @@ from transcriber.language import MULTI_SENTINEL, normalize_language_to_iso
         ("francais", "fr"),
         ("español", "es"),
         ("italiano", "it"),
+        # Languages added in the expanded dropdown — without these the
+        # detected-vs-selected mismatch warning silently fails to fire on
+        # them, which is exactly the bug the test_two_letter_garbage_no
+        # ... test was protecting against from the other direction.
+        ("hungarian", "hu"),
+        ("ukrainian", "uk"),
+        ("indonesian", "id"),
+        ("vietnamese", "vi"),
+        ("romanian", "ro"),
+        ("catalan", "ca"),
+        ("slovak", "sk"),
+        ("bulgarian", "bg"),
+        ("malay", "ms"),
+        ("thai", "th"),
+        ("hebrew", "he"),
+        ("persian", "fa"),
+        ("farsi", "fa"),
+        ("mandarin", "zh"),
     ],
 )
 def test_known_codes_normalize(value, expected):

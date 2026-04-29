@@ -248,14 +248,46 @@ with st.sidebar:
     st.divider()
     st.markdown("### Spoken Language")
 
-    # Standard languages list (simplified for cloud)
+    # Languages exposed by the dropdown. All entries below are supported
+    # by Deepgram's Nova family and by Whisper. The list is intentionally
+    # broader than the original five — both providers handle 40+ languages
+    # natively, so restricting the UI was hiding capability the API
+    # already had.
     LANGUAGES = {
         "Auto-detect (recommended)": None,
+        "Arabic": "ar",
+        "Bulgarian": "bg",
+        "Catalan": "ca",
+        "Chinese (Mandarin)": "zh",
+        "Czech": "cs",
+        "Danish": "da",
+        "Dutch": "nl",
         "English": "en",
-        "German": "de",
+        "Finnish": "fi",
         "French": "fr",
-        "Spanish": "es",
+        "German": "de",
+        "Greek": "el",
+        "Hebrew": "he",
+        "Hindi": "hi",
+        "Hungarian": "hu",
+        "Indonesian": "id",
         "Italian": "it",
+        "Japanese": "ja",
+        "Korean": "ko",
+        "Malay": "ms",
+        "Norwegian": "no",
+        "Persian (Farsi)": "fa",
+        "Polish": "pl",
+        "Portuguese": "pt",
+        "Romanian": "ro",
+        "Russian": "ru",
+        "Slovak": "sk",
+        "Spanish": "es",
+        "Swedish": "sv",
+        "Thai": "th",
+        "Turkish": "tr",
+        "Ukrainian": "uk",
+        "Vietnamese": "vi",
     }
 
     language_name = st.selectbox(
