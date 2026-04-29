@@ -409,29 +409,43 @@ if audio_file_path:
                 progress_bar.progress(current / total)
             status_text.markdown(f"**{message}**")
         
-        # Initialised before the try so the finally block is safe even if
-        # chunk_audio() itself raises before returning a list.
+        # Initialised before the try so the finally block can clean up any
+        # chunk temp files that ffmpeg produced before an error aborted the
+        # pipeline.
         chunk_paths: list[str] = []
         try:
-            # Step 1: Chunk the audio (using provider-specific upload ceiling).
+            # Stream chunks straight into the transcription pool: each
+            # chunk path is uploaded as soon as ffmpeg finishes encoding
+            # it, so encode-of-N+1 overlaps with upload-of-N. Reuse the
+            # duration from the already-cached audio info to avoid a
+            # duplicate ffprobe spawn.
             status_text.markdown("**Preparing audio…**")
-            # Reuse the duration from the already-cached audio info so the
-            # chunker doesn't re-spawn ffprobe just to learn the same value.
             cached_info = st.session_state.get("audio_info") or {}
-            chunk_paths = audio_processor.chunk_audio(
+            total_chunks, raw_chunk_iter = audio_processor.iter_chunks(
                 audio_file_path,
                 progress_callback=update_progress,
                 max_bytes=cloud_engine.get_max_chunk_bytes(cloud_provider),
                 duration_seconds=cached_info.get("duration_seconds"),
             )
 
-            # Step 2: Transcribe (Cloud Only)
+            def _collecting_iter():
+                """Tee the chunk iterator into ``chunk_paths`` for cleanup.
+
+                The transcription consumer drives ``raw_chunk_iter`` to
+                completion; we record each yielded path so the ``finally``
+                block can remove every temp file ffmpeg produced — even
+                if a partial run aborts midway through encoding.
+                """
+                for path in raw_chunk_iter:
+                    chunk_paths.append(path)
+                    yield path
 
             # Pass diarize flag only if supported (Deepgram)
             diarize_flag = enable_diarization if "Deepgram" in cloud_provider else False
 
-            result = cloud_engine.transcribe_chunks(
-                chunk_paths,
+            result = cloud_engine.transcribe_chunks_streaming(
+                chunk_iter=_collecting_iter(),
+                total=total_chunks,
                 provider=cloud_provider,
                 api_key=api_key.strip(),
                 language=language_code,
