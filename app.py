@@ -19,6 +19,7 @@ from transcriber import audio_processor
 from transcriber import cloud_engine
 from transcriber import exporter
 from transcriber import text_processor
+from transcriber import url_source
 from transcriber.language import MULTI_SENTINEL, normalize_language_to_iso
 
 
@@ -178,6 +179,14 @@ if "is_transcribing" not in st.session_state:
     st.session_state.is_transcribing = False
 if "audio_info" not in st.session_state:
     st.session_state.audio_info = None
+if "url_download_path" not in st.session_state:
+    # Last URL successfully fetched in this session, plus the file path
+    # the download landed at. Stored separately from the cached upload
+    # paths so a URL re-fetch doesn't get confused with a re-uploaded
+    # file of the same hash.
+    st.session_state.url_download_path = None
+if "url_download_source" not in st.session_state:
+    st.session_state.url_download_source = None
 
 
 
@@ -358,6 +367,78 @@ with col_path:
     )
 
 
+# ── URL input row ────────────────────────────────────────────────────────────
+
+st.markdown(
+    '<div class="section-eyebrow"><span class="num">03</span> Or paste a URL</div>',
+    unsafe_allow_html=True,
+)
+col_url, col_fetch = st.columns([4, 1])
+with col_url:
+    url_input = st.text_input(
+        "Audio/video URL (YouTube, podcast, direct media link)",
+        placeholder="https://www.youtube.com/watch?v=…",
+        help=(
+            "Paste a link to a YouTube video, podcast episode, or any media URL "
+            "supported by yt-dlp. The audio track is downloaded to a temporary "
+            "file and transcribed with the same pipeline as local uploads."
+        ),
+        label_visibility="collapsed",
+        key="url_input",
+    )
+with col_fetch:
+    fetch_url_clicked = st.button(
+        "Fetch URL",
+        use_container_width=True,
+        disabled=not url_input.strip(),
+        help="Download the audio for this URL into a temp file, then transcribe as normal.",
+    )
+
+if fetch_url_clicked and url_input.strip():
+    # If the user already fetched this URL in the current session, skip
+    # the network round-trip — this is the same caching pattern used for
+    # uploaded files (so a Streamlit rerun doesn't re-download).
+    if (
+        st.session_state.url_download_source == url_input.strip()
+        and st.session_state.url_download_path
+        and os.path.exists(st.session_state.url_download_path)
+    ):
+        st.success(
+            f"Using previously downloaded audio for {url_input.strip()}"
+        )
+    else:
+        # Drop the previous download (if any) before starting a new one —
+        # otherwise repeated fetches accumulate temp files for the
+        # session lifetime.
+        if st.session_state.url_download_path:
+            url_source.cleanup_url_download(st.session_state.url_download_path)
+            st.session_state.url_download_path = None
+            st.session_state.url_download_source = None
+
+        download_progress = st.progress(0.0)
+        download_status = st.empty()
+
+        def _url_progress(fraction: float, message: str) -> None:
+            download_progress.progress(min(max(fraction, 0.0), 1.0))
+            download_status.markdown(f"**{message}**")
+
+        try:
+            with st.spinner("Fetching audio from URL…"):
+                downloaded_path = url_source.download_audio_from_url(
+                    url_input.strip(),
+                    progress_callback=_url_progress,
+                )
+            st.session_state.url_download_path = downloaded_path
+            st.session_state.url_download_source = url_input.strip()
+            download_progress.progress(1.0)
+            download_status.markdown("**Audio downloaded — ready to transcribe.**")
+            st.success(f"Downloaded · **{os.path.basename(downloaded_path)}**")
+        except url_source.URLDownloadError as exc:
+            download_progress.empty()
+            download_status.empty()
+            st.error(str(exc))
+
+
 # ── Resolve the audio source ────────────────────────────────────────────────
 
 audio_file_path = None
@@ -387,6 +468,16 @@ elif file_path_input.strip():
         st.success(f"Resolved · **{os.path.basename(audio_file_path)}**")
     else:
         st.error(msg)
+elif (
+    st.session_state.url_download_path
+    and os.path.exists(st.session_state.url_download_path)
+):
+    # URL-downloaded files live in our own temp dir, so the deny-list
+    # path validation in ``validate_file`` would falsely reject them
+    # (it's designed for user-supplied filesystem paths). The download
+    # itself was performed by yt-dlp under our control, so trusting the
+    # path here is appropriate.
+    audio_file_path = st.session_state.url_download_path
 
 
 # ── Audio info & Transcribe button ──────────────────────────────────────────
