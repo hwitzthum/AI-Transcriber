@@ -413,6 +413,88 @@ def test_provider_max_chunk_bytes():
     print("  ✅ Per-provider chunk limits configured correctly")
 
 
+def test_parallel_transcribe_chunks_preserves_order(monkeypatch):
+    """Parallel chunk transcription must reassemble results in chunk-index
+    order regardless of which future completes first, and must surface
+    detected_language from the lowest-index chunk that reports one.
+
+    Why: with concurrency, the first future to *complete* is not the first
+    chunk; if we naively appended results in completion order the merged
+    transcript would be garbled and the detected-language picker would
+    become non-deterministic across runs.
+    """
+    import time as _time
+
+    separator("Parallel transcribe_chunks ordering")
+
+    # Three chunks; sleep durations are deliberately reverse-ordered so
+    # chunk index 2 finishes first if everything ran in parallel — the
+    # exact thing we want to stress-test.
+    fake_results = {
+        "chunk_a.mp3": {"text": "alpha beta gamma delta epsilon", "detected_language": "en"},
+        "chunk_b.mp3": {"text": "zeta eta theta iota kappa", "detected_language": "en"},
+        "chunk_c.mp3": {"text": "lambda mu nu xi omicron", "detected_language": "en"},
+    }
+    sleeps = {"chunk_a.mp3": 0.10, "chunk_b.mp3": 0.05, "chunk_c.mp3": 0.01}
+
+    def fake_transcribe_single(file_path, provider, config, client, language, diarize):
+        _time.sleep(sleeps[file_path])
+        return fake_results[file_path]
+
+    monkeypatch.setattr(cloud_engine, "_transcribe_single", fake_transcribe_single)
+    monkeypatch.setattr(cloud_engine, "_create_client", lambda provider, key: object())
+
+    result = cloud_engine.transcribe_chunks(
+        ["chunk_a.mp3", "chunk_b.mp3", "chunk_c.mp3"],
+        provider="OpenAI Whisper API",
+        api_key="fake",
+        max_workers=3,
+    )
+
+    # The merged transcript must contain words in chunk-index order even
+    # though chunk_c (index 2) completed first.
+    text = result["text"]
+    pos_a = text.find("alpha")
+    pos_z = text.find("zeta")
+    pos_l = text.find("lambda")
+    print(f"  positions: alpha={pos_a}, zeta={pos_z}, lambda={pos_l}")
+    assert pos_a >= 0 and pos_z > pos_a and pos_l > pos_z, (
+        "Chunks must be assembled in index order, not completion order"
+    )
+    assert result["failed_chunks"] == []
+    assert result["detected_language"] == "en"
+    print("  ✅ Parallel results assembled in chunk-index order")
+
+
+def test_parallel_transcribe_chunks_graceful_degradation(monkeypatch):
+    """A failing chunk in the middle must not abort the whole job — the
+    surviving chunks are merged and the failure index is reported."""
+    separator("Parallel transcribe_chunks graceful degradation")
+
+    def fake_transcribe_single(file_path, provider, config, client, language, diarize):
+        if file_path == "boom.mp3":
+            raise RuntimeError("simulated transient failure")
+        return {"text": f"text from {file_path}", "detected_language": None}
+
+    monkeypatch.setattr(cloud_engine, "_transcribe_single", fake_transcribe_single)
+    monkeypatch.setattr(cloud_engine, "_create_client", lambda provider, key: object())
+
+    result = cloud_engine.transcribe_chunks(
+        ["ok1.mp3", "boom.mp3", "ok2.mp3"],
+        provider="OpenAI Whisper API",
+        api_key="fake",
+        max_workers=3,
+    )
+
+    assert result["failed_chunks"] == [1], "Should report index 1 as failed"
+    # Surviving chunks merged in order
+    assert "text from ok1.mp3" in result["text"]
+    assert "text from ok2.mp3" in result["text"]
+    # Failure should surface as a quality warning
+    assert any("Chunk 2 failed" in w for w in result["quality_warnings"])
+    print("  ✅ Graceful degradation works under parallel execution")
+
+
 # Run with: uv run pytest tests/
 # The previous __main__ block omitted the Deepgram paragraphs/words
 # formatter tests from its hand-curated list, so running this file

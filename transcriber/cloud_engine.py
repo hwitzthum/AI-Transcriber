@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 from groq import Groq
@@ -207,6 +208,13 @@ def get_max_chunk_bytes(provider: str) -> int:
 # Chunks that produce fewer words than this are flagged as potentially garbage.
 _MIN_WORDS_PER_CHUNK = 3
 
+# How many chunk uploads to run concurrently. The dominant cost is the
+# server-side decode + transcription, so 2–3 in flight overlaps network
+# round-trips and keeps end-to-end wall time near (longest_chunk + epsilon)
+# rather than (sum_of_chunks). Capped low to stay polite to provider rate
+# limits — Groq's free tier in particular is sensitive to bursts.
+_DEFAULT_TRANSCRIBE_WORKERS = 3
+
 # How many words from the end of the previous chunk to compare against when
 # deduplicating overlap regions. Larger window = safer but slower.
 _DEDUP_WINDOW_WORDS = 40
@@ -230,14 +238,18 @@ def transcribe_chunks(
     progress_callback=None,
     diarize: bool = False,
     chunk_overlap_ms: int = 5000,
+    max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
 ) -> dict:
     """
     Transcribe audio chunks using a cloud API.
 
-    Implements graceful degradation: if a chunk fails after all retries, it is
-    marked as failed and skipped rather than aborting the entire transcription.
-    Overlapping regions between consecutive chunks are deduplicated to avoid
-    repeated sentences at chunk join points.
+    Chunks are uploaded concurrently (up to ``max_workers`` at a time) so
+    network round-trips overlap. Results are reassembled in chunk-index order
+    before deduplication so the merged transcript is deterministic regardless
+    of completion order. Implements graceful degradation: if a chunk fails
+    after all retries, it is marked as failed and skipped rather than aborting
+    the entire transcription. Overlapping regions between consecutive chunks
+    are deduplicated to avoid repeated sentences at chunk join points.
 
     Args:
         chunk_paths: List of paths to audio chunk files.
@@ -245,9 +257,13 @@ def transcribe_chunks(
         api_key: API key for the chosen provider.
         language: Language code or None for auto-detect.
         progress_callback: Callable(current, total, message) for progress updates.
+            Always invoked from the calling thread, never from a worker thread,
+            so Streamlit's ScriptRunContext stays attached.
         diarize: Whether to enable speaker diarization (Deepgram only).
         chunk_overlap_ms: Overlap duration in milliseconds used during chunking.
             Used to estimate how aggressively to dedup chunk boundaries.
+        max_workers: Maximum concurrent in-flight uploads. Defaults to a
+            conservative value that respects provider rate limits.
 
     Returns:
         dict with keys:
@@ -262,64 +278,115 @@ def transcribe_chunks(
         raise ValueError(f"Unknown provider: {provider}. Choose from: {list(PROVIDERS.keys())}")
 
     config = PROVIDERS[provider]
-    transcripts: list[str] = []
     failed_chunks: list[int] = []
     detected_language: str | None = None
     quality_warnings: list[str] = []
     total = len(chunk_paths)
 
-    # Create API client once for reuse across all chunks
+    if total == 0:
+        return {
+            "text": "",
+            "failed_chunks": [],
+            "detected_language": None,
+            "quality_warnings": [],
+        }
+
+    # Create API client once for reuse across all chunks. Provider SDK
+    # clients are documented as safe to share across threads.
     client = _create_client(provider, api_key)
 
-    # Track timing for ETA estimation
+    # Per-index slots so we can reassemble in deterministic order even
+    # when futures complete out of order.
+    results: list[dict | None] = [None] * total
+    errors: list[BaseException | None] = [None] * total
+
+    # Cap worker count at chunk count to avoid spawning idle threads.
+    workers = max(1, min(max_workers, total))
     start_time = time.monotonic()
-    chunk_times: list[float] = []
 
-    for i, chunk_path in enumerate(chunk_paths):
-        chunk_start = time.monotonic()
+    if progress_callback:
+        progress_callback(
+            0,
+            total,
+            f"Transcribing {total} chunk(s) via {provider}"
+            + (f" ({workers} in parallel)..." if workers > 1 and total > 1 else "..."),
+        )
 
-        # Build a progress message that includes ETA when we have timing data
-        eta_str = _estimate_eta(i, total, chunk_times)
-        progress_msg = f"Transcribing chunk {i + 1}/{total} via {provider}...{eta_str}"
-        if progress_callback:
-            progress_callback(i, total, progress_msg)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                _transcribe_single,
+                chunk_path,
+                provider,
+                config,
+                client,
+                language,
+                diarize,
+            ): i
+            for i, chunk_path in enumerate(chunk_paths)
+        }
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            try:
+                results[i] = future.result()
+            except BaseException as exc:  # noqa: BLE001 — graceful degradation
+                # Graceful degradation: record the failure, keep going.
+                logger.error(
+                    "Chunk %d/%d failed after all retries: %s",
+                    i + 1, total, exc, exc_info=True,
+                )
+                errors[i] = exc
+            completed += 1
 
-        try:
-            result = _transcribe_single(chunk_path, provider, config, client, language, diarize)
-            text = result["text"]
-            chunk_lang = result.get("detected_language")
-
-            # Capture detected language from the first chunk that reports one
-            if chunk_lang and detected_language is None:
-                detected_language = chunk_lang
-
-            text = text.strip() if text else ""
-
-            # Quality check: warn on suspiciously short or empty chunks
-            if not text:
-                logger.warning("Chunk %d/%d produced empty transcript", i + 1, total)
-                quality_warnings.append(f"Chunk {i + 1} produced no text (may be silence or noise).")
-            elif len(text.split()) < _MIN_WORDS_PER_CHUNK:
-                logger.warning("Chunk %d/%d produced very short transcript: %r", i + 1, total, text)
-                quality_warnings.append(
-                    f"Chunk {i + 1} produced very little text ({len(text.split())} word(s)): {text!r}"
+            if progress_callback:
+                eta_str = _estimate_parallel_eta(
+                    completed, total, time.monotonic() - start_time
+                )
+                progress_callback(
+                    completed,
+                    total,
+                    f"Transcribed {completed}/{total} chunks via {provider}{eta_str}",
                 )
 
-            if text:
-                transcripts.append(text)
-
-        except Exception as exc:
-            # Graceful degradation: log the failure, record the index, and continue
-            logger.error(
-                "Chunk %d/%d failed after all retries: %s", i + 1, total, exc, exc_info=True
-            )
+    # Walk the slots in order so transcript assembly, detected_language
+    # selection, and warning ordering all match the pre-parallel behaviour.
+    transcripts: list[str] = []
+    for i in range(total):
+        if errors[i] is not None:
             failed_chunks.append(i)
             quality_warnings.append(
-                f"Chunk {i + 1} failed and was skipped: {redact_secrets(str(exc))}"
+                f"Chunk {i + 1} failed and was skipped: {redact_secrets(str(errors[i]))}"
+            )
+            continue
+
+        result = results[i] or {}
+        text = result.get("text") or ""
+        chunk_lang = result.get("detected_language")
+
+        # First chunk (by index) that reports a language wins — same rule
+        # as the previous sequential path.
+        if chunk_lang and detected_language is None:
+            detected_language = chunk_lang
+
+        text = text.strip()
+
+        if not text:
+            logger.warning("Chunk %d/%d produced empty transcript", i + 1, total)
+            quality_warnings.append(
+                f"Chunk {i + 1} produced no text (may be silence or noise)."
+            )
+        elif len(text.split()) < _MIN_WORDS_PER_CHUNK:
+            logger.warning(
+                "Chunk %d/%d produced very short transcript: %r", i + 1, total, text
+            )
+            quality_warnings.append(
+                f"Chunk {i + 1} produced very little text "
+                f"({len(text.split())} word(s)): {text!r}"
             )
 
-        chunk_elapsed = time.monotonic() - chunk_start
-        chunk_times.append(chunk_elapsed)
+        if text:
+            transcripts.append(text)
 
     if progress_callback:
         progress_callback(total, total, "Transcription complete!")
@@ -357,6 +424,9 @@ def _estimate_eta(completed: int, total: int, chunk_times: list[float]) -> str:
     Return a human-readable ETA string like ' (ETA ~2m 30s)' or '' if unknown.
 
     Uses a rolling average of the last 5 chunk durations to smooth estimates.
+    Retained for callers that already track per-chunk durations (the
+    sequential code path); the concurrent path uses
+    :func:`_estimate_parallel_eta` instead.
     """
     if completed == 0 or not chunk_times:
         return ""
@@ -366,6 +436,26 @@ def _estimate_eta(completed: int, total: int, chunk_times: list[float]) -> str:
     remaining_chunks = total - completed
     eta_seconds = avg_seconds * remaining_chunks
 
+    return _format_eta_seconds(eta_seconds)
+
+
+def _estimate_parallel_eta(completed: int, total: int, elapsed_seconds: float) -> str:
+    """ETA for the parallel transcription path.
+
+    Per-chunk wall time isn't a useful unit when chunks run concurrently,
+    so we extrapolate from total elapsed time instead: avg-throughput so
+    far times remaining chunks. Returns '' until at least one chunk has
+    completed (otherwise the estimate is meaningless noise).
+    """
+    if completed == 0 or total <= 0:
+        return ""
+    avg_per_chunk = elapsed_seconds / completed
+    remaining = total - completed
+    return _format_eta_seconds(avg_per_chunk * remaining)
+
+
+def _format_eta_seconds(eta_seconds: float) -> str:
+    """Format a seconds value as ' (ETA ~Xs)' or ' (ETA ~Xm Ys)'."""
     if eta_seconds < 60:
         return f" (ETA ~{int(eta_seconds)}s)"
     minutes, seconds = divmod(int(eta_seconds), 60)
