@@ -9,8 +9,6 @@ Tests all key design decisions:
 
 import os
 import sys
-import tempfile
-import time
 
 import pytest
 

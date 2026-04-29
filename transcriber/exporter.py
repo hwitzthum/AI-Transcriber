@@ -5,7 +5,6 @@ import datetime
 import os
 import re
 import sys
-from pathlib import Path
 from typing import Optional, Tuple, List
 
 from docx import Document

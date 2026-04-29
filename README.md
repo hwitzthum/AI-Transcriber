@@ -88,7 +88,7 @@ Paste your API key into the **API Key** field. Keys are session-only and never s
 
 ### 2. Set the Language
 
-Under **Language**, choose:
+Under **Spoken Language**, choose:
 - **Auto-detect** — the API identifies the language automatically
 - **German / French / English** — set explicitly for best accuracy on single-language files
 
@@ -98,7 +98,7 @@ Under **Language**, choose:
 
 ### 3. Enable Speaker Diarization (Optional)
 
-If your recording has **multiple speakers** (e.g., an interview or meeting), tick **Enable Speaker Diarization** in the sidebar.
+If your recording has **multiple speakers** (e.g., an interview or meeting), tick **Speaker Diarization** in the sidebar.
 
 This is only available with Deepgram providers. When enabled, the transcript labels each speaker:
 
@@ -128,7 +128,7 @@ Audio info (duration, size, sample rate) is displayed immediately. Large files w
 
 ### 5. Transcribe
 
-Click **🚀 Start Transcription**.
+Click **Begin Transcription**.
 
 A progress bar and live status show which chunk is being processed, plus an estimated time remaining (ETA) for large files.
 
@@ -136,7 +136,7 @@ When complete:
 - A detected language notice appears if Auto-detect was used
 - If you forced a specific language and the API detected a different one, a warning is shown so you can re-run with Auto-detect or pick the matching language — this prevents the "garbled output because the wrong language was forced" failure mode
 - Any failed chunks or quality warnings are shown
-- 🎉 Balloons appear on success
+- Balloons appear on success
 
 > **Note:** Transcripts are produced in the spoken language of the audio. The app does not translate — choose Auto-detect or the actual spoken language, not your preferred output language.
 
@@ -156,7 +156,7 @@ A formatted visual view. Use the **Search** box to find and highlight specific w
 
 ### 7. Improve Readability
 
-Expand **📖 Readability Options**:
+Expand **Readability options**:
 
 **Highlight filler words** — tick the checkbox and click **Apply Filler Highlighting**. Filler words (um, uh, äh, euh, like, basically, etc.) appear in *italic gray* so you can spot them at a glance. They are stripped cleanly on export.
 
@@ -164,7 +164,7 @@ Expand **📖 Readability Options**:
 
 ### 8. Rename Speakers
 
-If diarization is enabled, expand **👥 Rename Speakers**. Type the actual name for each speaker and click **Apply Speaker Names**:
+If diarization is enabled, expand **Rename speakers**. Type the actual name for each speaker and click **Apply Speaker Names**:
 
 ```
 Speaker 0 → Maria
@@ -177,7 +177,7 @@ The labels update throughout the entire transcript instantly. Exported documents
 
 ### 9. Download
 
-Click **📄 Download DOCX** or **📕 Download PDF**.
+Click **Download · DOCX** or **Download · PDF**.
 
 Both formats include:
 - Speaker names in **bold blue** on their own line
@@ -193,7 +193,7 @@ Both formats include:
 Transcriber/
 ├── app.py                   # Streamlit entry point and UI
 ├── assets/
-│   └── styles.css           # "Studio Noir" stylesheet (loaded by app.py)
+│   └── styles.css           # Editorial paper-and-ink stylesheet (loaded by app.py)
 ├── transcriber/
 │   ├── __init__.py
 │   ├── audio_processor.py   # Format conversion, chunking, ffprobe metadata
@@ -202,10 +202,12 @@ Transcriber/
 │   ├── language.py          # ISO-639-1 normalization for detected languages
 │   └── text_processor.py    # Filler detection, speaker renaming, search highlight
 ├── tests/
-│   ├── test_all.py          # Core test suite (audio, chunking, export)
-│   ├── test_cloud_engine.py # Cloud engine unit tests (retry, dedup, garbage detection)
-│   ├── test_language.py     # Language code normalization
-│   └── test_text_processor.py
+│   ├── test_all.py            # Core test suite (audio, chunking, export)
+│   ├── test_cloud_engine.py   # Cloud engine unit tests (retry, dedup, garbage detection)
+│   ├── test_language.py       # Language code normalization
+│   ├── test_redact_secrets.py # Verifies API keys are stripped from error messages
+│   ├── test_text_processor.py
+│   └── _make_test_video.py    # Manual fixture regen (not run by pytest)
 ├── pyproject.toml
 └── README.md
 ```
