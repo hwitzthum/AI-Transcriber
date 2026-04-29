@@ -466,6 +466,66 @@ def test_parallel_transcribe_chunks_preserves_order(monkeypatch):
     print("  ✅ Parallel results assembled in chunk-index order")
 
 
+def test_streaming_overlaps_chunking_and_transcription(monkeypatch):
+    """Streaming chunker + transcribe must overlap: while the producer is
+    still yielding chunk N+1, chunk N must already be uploading.
+
+    Why this matters: the whole point of transcribe_chunks_streaming is to
+    cut end-to-end wall time on long files by running ffmpeg encode in
+    parallel with API uploads. If the consumer naively materialised the
+    iterator before submitting (or held a lock), this test's wall time
+    would be (chunking_time + transcription_time) instead of
+    ~max(chunking_time, transcription_time).
+    """
+    import time as _time
+
+    separator("Streaming overlap of chunking + transcription")
+
+    chunk_count = 4
+    encode_secs = 0.20  # simulated ffmpeg encode per chunk
+    upload_secs = 0.20  # simulated API call per chunk
+
+    def fake_chunk_iter():
+        for i in range(chunk_count):
+            _time.sleep(encode_secs)
+            yield f"chunk_{i}.mp3"
+
+    def fake_transcribe_single(file_path, provider, config, client, language, diarize):
+        _time.sleep(upload_secs)
+        return {"text": f"text-from-{file_path}", "detected_language": "en"}
+
+    monkeypatch.setattr(cloud_engine, "_transcribe_single", fake_transcribe_single)
+    monkeypatch.setattr(cloud_engine, "_create_client", lambda provider, key: object())
+
+    t0 = _time.monotonic()
+    result = cloud_engine.transcribe_chunks_streaming(
+        chunk_iter=fake_chunk_iter(),
+        total=chunk_count,
+        provider="OpenAI Whisper API",
+        api_key="fake",
+        max_workers=3,
+    )
+    elapsed = _time.monotonic() - t0
+
+    sequential_baseline = chunk_count * (encode_secs + upload_secs)
+    print(f"  elapsed: {elapsed:.2f}s, sequential baseline: {sequential_baseline:.2f}s")
+
+    # If overlap works, elapsed should be well under the sequential
+    # baseline (encoding + uploading every chunk back-to-back). Allow
+    # generous slack for CI jitter; even on a slow machine the overlap
+    # should easily beat 80% of the baseline.
+    assert elapsed < sequential_baseline * 0.8, (
+        f"Streaming pipeline did not overlap encoding with upload "
+        f"(elapsed={elapsed:.2f}s vs baseline={sequential_baseline:.2f}s)"
+    )
+
+    # Result still in chunk-index order
+    assert "text-from-chunk_0.mp3" in result["text"]
+    assert "text-from-chunk_3.mp3" in result["text"]
+    assert result["text"].index("chunk_0") < result["text"].index("chunk_3")
+    print("  ✅ Encoding and uploading overlap correctly")
+
+
 def test_parallel_transcribe_chunks_graceful_degradation(monkeypatch):
     """A failing chunk in the middle must not abort the whole job — the
     surviving chunks are merged and the failure index is reported."""

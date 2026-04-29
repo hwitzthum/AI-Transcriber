@@ -5,6 +5,7 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterable
 
 from openai import OpenAI
 from groq import Groq
@@ -241,27 +242,74 @@ def transcribe_chunks(
     max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
 ) -> dict:
     """
-    Transcribe audio chunks using a cloud API.
+    Transcribe a fully-prepared list of audio chunks using a cloud API.
 
-    Chunks are uploaded concurrently (up to ``max_workers`` at a time) so
-    network round-trips overlap. Results are reassembled in chunk-index order
-    before deduplication so the merged transcript is deterministic regardless
-    of completion order. Implements graceful degradation: if a chunk fails
-    after all retries, it is marked as failed and skipped rather than aborting
-    the entire transcription. Overlapping regions between consecutive chunks
-    are deduplicated to avoid repeated sentences at chunk join points.
+    Thin wrapper around :func:`transcribe_chunks_streaming` that takes a
+    materialised ``chunk_paths`` list. Use :func:`transcribe_chunks_streaming`
+    directly when chunks are produced incrementally and you want to overlap
+    upload with chunking.
+
+    See :func:`transcribe_chunks_streaming` for the full contract.
+    """
+    return transcribe_chunks_streaming(
+        chunk_iter=iter(chunk_paths),
+        total=len(chunk_paths),
+        provider=provider,
+        api_key=api_key,
+        language=language,
+        progress_callback=progress_callback,
+        diarize=diarize,
+        chunk_overlap_ms=chunk_overlap_ms,
+        max_workers=max_workers,
+    )
+
+
+def transcribe_chunks_streaming(
+    chunk_iter: Iterable[str],
+    total: int,
+    provider: str,
+    api_key: str,
+    language: str | None = None,
+    progress_callback=None,
+    diarize: bool = False,
+    chunk_overlap_ms: int = 5000,
+    max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
+) -> dict:
+    """
+    Transcribe audio chunks as they arrive from ``chunk_iter``.
+
+    Each chunk path produced by the iterator is submitted to the API
+    thread pool immediately, so an upstream producer (typically the
+    streaming ffmpeg chunker) can start encoding the next chunk while
+    the previous one is already uploading. Results are reassembled in
+    chunk-index order before deduplication so the merged transcript is
+    deterministic regardless of completion order.
+
+    Implements graceful degradation: if a chunk fails after all retries,
+    it is marked as failed and skipped rather than aborting the entire
+    transcription. Overlapping regions between consecutive chunks are
+    deduplicated to avoid repeated sentences at chunk join points.
 
     Args:
-        chunk_paths: List of paths to audio chunk files.
+        chunk_iter: Iterable of chunk file paths in chunk-index order.
+            May be a generator that blocks while ffmpeg encodes the next
+            chunk; the implementation drains completed transcription
+            futures opportunistically while waiting.
+        total: Total number of chunks the iterator will produce. Required
+            so the progress bar can be sized correctly before any chunks
+            arrive. If the iterator yields fewer paths than ``total``
+            (e.g. tail chunk shorter than the minimum), the actual count
+            is reported in the progress messages.
         provider: Cloud provider name (key from PROVIDERS dict).
         api_key: API key for the chosen provider.
         language: Language code or None for auto-detect.
-        progress_callback: Callable(current, total, message) for progress updates.
-            Always invoked from the calling thread, never from a worker thread,
-            so Streamlit's ScriptRunContext stays attached.
+        progress_callback: Callable(current, total, message) for progress
+            updates. Always invoked from the calling thread, never from
+            a worker thread, so Streamlit's ScriptRunContext stays attached.
         diarize: Whether to enable speaker diarization (Deepgram only).
-        chunk_overlap_ms: Overlap duration in milliseconds used during chunking.
-            Used to estimate how aggressively to dedup chunk boundaries.
+        chunk_overlap_ms: Overlap duration in milliseconds used during
+            chunking. Used to estimate how aggressively to dedup chunk
+            boundaries.
         max_workers: Maximum concurrent in-flight uploads. Defaults to a
             conservative value that respects provider rate limits.
 
@@ -281,7 +329,6 @@ def transcribe_chunks(
     failed_chunks: list[int] = []
     detected_language: str | None = None
     quality_warnings: list[str] = []
-    total = len(chunk_paths)
 
     if total == 0:
         return {
@@ -296,9 +343,12 @@ def transcribe_chunks(
     client = _create_client(provider, api_key)
 
     # Per-index slots so we can reassemble in deterministic order even
-    # when futures complete out of order.
+    # when futures complete out of order. Sized to ``total`` up front;
+    # if the iterator yields fewer paths the unused slots stay None and
+    # are skipped during assembly.
     results: list[dict | None] = [None] * total
     errors: list[BaseException | None] = [None] * total
+    seen_indices: list[int] = []
 
     # Cap worker count at chunk count to avoid spawning idle threads.
     workers = max(1, min(max_workers, total))
@@ -313,32 +363,44 @@ def transcribe_chunks(
         )
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(
-                _transcribe_single,
-                chunk_path,
-                provider,
-                config,
-                client,
-                language,
-                diarize,
-            ): i
-            for i, chunk_path in enumerate(chunk_paths)
-        }
-        for future in as_completed(future_to_idx):
-            i = future_to_idx[future]
+    pending: dict = {}  # future -> index
+
+    def _drain(block: bool) -> int:
+        """Pull completed futures out of ``pending`` and update progress.
+
+        ``block=False`` peeks at finished futures without waiting, so the
+        producer loop can publish progress as uploads complete in the
+        background. ``block=True`` waits until at least one future is
+        done; used by the post-producer drain loop to retire the rest.
+
+        Returns the number of futures retired in this call.
+        """
+        nonlocal completed
+        retired = 0
+        if not pending:
+            return retired
+        if block:
+            # Wait for at least one completion, then sweep all done.
+            done_iter = as_completed(list(pending.keys()))
             try:
-                results[i] = future.result()
+                first = next(done_iter)
+            except StopIteration:
+                return retired
+            done_now = [first] + [f for f in pending if f is not first and f.done()]
+        else:
+            done_now = [f for f in pending if f.done()]
+        for f in done_now:
+            i = pending.pop(f)
+            try:
+                results[i] = f.result()
             except BaseException as exc:  # noqa: BLE001 — graceful degradation
-                # Graceful degradation: record the failure, keep going.
                 logger.error(
                     "Chunk %d/%d failed after all retries: %s",
                     i + 1, total, exc, exc_info=True,
                 )
                 errors[i] = exc
             completed += 1
-
+            retired += 1
             if progress_callback:
                 eta_str = _estimate_parallel_eta(
                     completed, total, time.monotonic() - start_time
@@ -348,11 +410,50 @@ def transcribe_chunks(
                     total,
                     f"Transcribed {completed}/{total} chunks via {provider}{eta_str}",
                 )
+        return retired
 
-    # Walk the slots in order so transcript assembly, detected_language
-    # selection, and warning ordering all match the pre-parallel behaviour.
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Producer loop: as each chunk path arrives from the iterator,
+        # submit it immediately so the API call begins while the next
+        # chunk is still being encoded upstream.
+        for i, chunk_path in enumerate(chunk_iter):
+            if i >= total:
+                # Iterator yielded more paths than declared. Treat the
+                # extras as chunk-N+ to avoid silently dropping them — but
+                # this indicates a planning bug upstream, so log it.
+                logger.warning(
+                    "Chunk iterator yielded more than %d declared chunks (got index %d)",
+                    total, i,
+                )
+                results.append(None)
+                errors.append(None)
+            seen_indices.append(i)
+            future = executor.submit(
+                _transcribe_single,
+                chunk_path,
+                provider,
+                config,
+                client,
+                language,
+                diarize,
+            )
+            pending[future] = i
+            # Opportunistically retire any futures that finished while
+            # we were waiting on the producer. Non-blocking — we always
+            # want to come back and submit more chunks promptly.
+            _drain(block=False)
+
+        # Producer is done; wait for any still-running futures.
+        while pending:
+            _drain(block=True)
+
+    actual_total = len(seen_indices)
+
+    # Walk the slots in chunk-index order so transcript assembly,
+    # detected_language selection, and warning ordering all match the
+    # pre-streaming behaviour.
     transcripts: list[str] = []
-    for i in range(total):
+    for i in sorted(seen_indices):
         if errors[i] is not None:
             failed_chunks.append(i)
             quality_warnings.append(
@@ -372,13 +473,14 @@ def transcribe_chunks(
         text = text.strip()
 
         if not text:
-            logger.warning("Chunk %d/%d produced empty transcript", i + 1, total)
+            logger.warning("Chunk %d/%d produced empty transcript", i + 1, actual_total)
             quality_warnings.append(
                 f"Chunk {i + 1} produced no text (may be silence or noise)."
             )
         elif len(text.split()) < _MIN_WORDS_PER_CHUNK:
             logger.warning(
-                "Chunk %d/%d produced very short transcript: %r", i + 1, total, text
+                "Chunk %d/%d produced very short transcript: %r",
+                i + 1, actual_total, text,
             )
             quality_warnings.append(
                 f"Chunk {i + 1} produced very little text "
@@ -389,7 +491,7 @@ def transcribe_chunks(
             transcripts.append(text)
 
     if progress_callback:
-        progress_callback(total, total, "Transcription complete!")
+        progress_callback(actual_total, actual_total, "Transcription complete!")
 
     # Deduplicate overlapping regions between consecutive chunk transcripts
     merged = _deduplicate_overlap(transcripts)

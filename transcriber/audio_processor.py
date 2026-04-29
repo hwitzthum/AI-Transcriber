@@ -13,6 +13,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Iterator
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -218,6 +219,59 @@ def needs_chunking(file_path: str, max_bytes: int = MAX_CHUNK_BYTES) -> bool:
     return os.path.getsize(file_path) > max_bytes
 
 
+def iter_chunks(
+    file_path: str,
+    progress_callback=None,
+    max_bytes: int = MAX_CHUNK_BYTES,
+    duration_seconds: float | None = None,
+) -> tuple[int, Iterator[str]]:
+    """Streaming variant of :func:`chunk_audio`.
+
+    Returns ``(total_chunks, iterator)`` so the caller can pre-size
+    progress bars before consuming the generator. The iterator yields one
+    chunk path at a time, lazily, so an upstream consumer (e.g. the cloud
+    transcription pool) can begin uploading chunk N while ffmpeg is still
+    encoding chunk N+1 — which is the dominant wall-time win on multi-hour
+    files.
+
+    Files at or below ``max_bytes`` yield exactly one path (the
+    transcoded MP3 — or the original if it's already MP3). The caller is
+    responsible for cleaning up yielded paths via :func:`cleanup_chunks`.
+
+    ``duration_seconds`` is an optional optimisation: callers that already
+    have the duration (from a prior :func:`get_audio_info` call) can pass
+    it in to skip a duplicate ffprobe spawn inside the chunker.
+    """
+    require_ffmpeg()
+
+    file_size = os.path.getsize(file_path)
+
+    if file_size <= max_bytes:
+        # Single-chunk path. Compute total = 1 up front; yield the
+        # transcoded MP3 (which may be the original path unchanged when
+        # the input is already MP3).
+        def _single() -> Iterator[str]:
+            yield _ensure_mp3(file_path)
+        return 1, _single()
+
+    # Multi-chunk path. We need the chunk count up front for the progress
+    # bar, so resolve duration here once and pass it through to avoid a
+    # second ffprobe spawn inside the generator.
+    total_seconds = (
+        duration_seconds
+        if duration_seconds is not None
+        else _get_duration_seconds(file_path)
+    )
+    _, _, num_chunks = _plan_ffmpeg_chunks(total_seconds, max_bytes)
+
+    return num_chunks, _iter_chunks_with_ffmpeg(
+        file_path,
+        progress_callback=progress_callback,
+        max_bytes=max_bytes,
+        duration_seconds=total_seconds,
+    )
+
+
 def chunk_audio(
     file_path: str,
     progress_callback=None,
@@ -316,25 +370,53 @@ def _get_duration_seconds(file_path: str) -> float:
         )
 
 
-def _chunk_with_ffmpeg(
+def _plan_ffmpeg_chunks(
+    total_seconds: float,
+    max_bytes: int,
+) -> tuple[float, float, int]:
+    """Compute (chunk_duration_sec, step_sec, num_chunks) for the chunker.
+
+    Extracted so the streaming and list-returning paths share the same
+    arithmetic — a regression here would otherwise be easy to introduce.
+    Bitrate is fixed at 128 kbps mono (matches the encoder flags below).
+    """
+    bitrate_kbps = 128
+    bytes_per_second = (bitrate_kbps * 1000) / 8
+    chunk_duration_sec = max_bytes / bytes_per_second
+    overlap_sec = OVERLAP_MS / 1000.0
+
+    # Safety guard: chunk must be longer than overlap
+    chunk_duration_sec = max(chunk_duration_sec, overlap_sec + 1.0)
+    step_sec = chunk_duration_sec - overlap_sec
+
+    num_chunks = max(1, math.ceil(total_seconds / step_sec))
+    return chunk_duration_sec, step_sec, num_chunks
+
+
+# Tail chunks shorter than this produce ffmpeg outputs of a few
+# milliseconds — the API transcribes them as silence and the quality
+# warning fires on every multi-chunk run. Half a second is well below
+# any meaningful speech segment.
+_MIN_CHUNK_SEC = 0.5
+
+
+def _iter_chunks_with_ffmpeg(
     file_path: str,
     progress_callback=None,
     max_bytes: int = MAX_CHUNK_BYTES,
     duration_seconds: float | None = None,
-) -> list[str]:
-    """
-    Slice a file into MP3 chunks using ffmpeg without loading it into RAM.
+) -> Iterator[str]:
+    """Generator: yield each chunk path as ffmpeg finishes encoding it.
 
-    ffmpeg reads and encodes the audio stream sequentially, so peak RAM usage
-    is proportional to one chunk's worth of buffered audio — typically a few
-    MB — rather than the full file size.
+    Uses the same per-chunk ffmpeg invocation as the legacy list-returning
+    path, but emits each chunk to the caller as soon as it's on disk so
+    the next stage (transcription upload) can start immediately rather
+    than waiting for the entire file to be sliced.
 
-    Each chunk overlaps with the next by OVERLAP_MS milliseconds. The cloud
-    engine's deduplication logic removes the repeated words after transcription.
-
-    Callers that already know the duration (from a prior ``get_audio_info``
-    call) can pass it in via ``duration_seconds`` to avoid a duplicate
-    ffprobe subprocess spawn here.
+    On encoder error the generator raises and any already-yielded paths
+    remain on disk — the caller is responsible for cleanup (the streaming
+    orchestrator collects yielded paths into a list it cleans up in a
+    ``finally`` block).
     """
     total_seconds = (
         duration_seconds
@@ -342,19 +424,9 @@ def _chunk_with_ffmpeg(
         else _get_duration_seconds(file_path)
     )
 
-    # Calculate chunk and step duration to stay under max_bytes at 128 kbps
-    bitrate_kbps = 128
-    bytes_per_second = (bitrate_kbps * 1000) / 8
-    chunk_duration_sec = max_bytes / bytes_per_second
-    overlap_sec = OVERLAP_MS / 1000.0
-    step_sec = chunk_duration_sec - overlap_sec
-
-    # Safety guard: chunk must be longer than overlap
-    chunk_duration_sec = max(chunk_duration_sec, overlap_sec + 1.0)
-    step_sec = chunk_duration_sec - overlap_sec
-
-    num_chunks = max(1, math.ceil(total_seconds / step_sec))
-    chunk_paths: list[str] = []
+    chunk_duration_sec, step_sec, num_chunks = _plan_ffmpeg_chunks(
+        total_seconds, max_bytes
+    )
 
     logger.info(
         "ffmpeg chunking: %.0f s total, %.0f s chunks, %d chunks",
@@ -363,17 +435,10 @@ def _chunk_with_ffmpeg(
         num_chunks,
     )
 
-    # Tail chunks shorter than this produce ffmpeg outputs of a few
-    # milliseconds — the API transcribes them as silence and the quality
-    # warning fires on every multi-chunk run. Half a second is well below
-    # any meaningful speech segment.
-    MIN_CHUNK_SEC = 0.5
-
     for i in range(num_chunks):
         start_sec = i * step_sec
-        # Do not exceed file duration
         actual_duration_sec = min(chunk_duration_sec, total_seconds - start_sec)
-        if actual_duration_sec < MIN_CHUNK_SEC:
+        if actual_duration_sec < _MIN_CHUNK_SEC:
             break
 
         with tempfile.NamedTemporaryFile(
@@ -382,12 +447,6 @@ def _chunk_with_ffmpeg(
             dir=tempfile.gettempdir(),
         ) as tmp:
             out_path = tmp.name
-
-        # Track the temp file BEFORE running ffmpeg so the caller's
-        # ``cleanup_chunks`` finally handler can remove it even when
-        # this chunk is the one that fails. Previously the append
-        # happened only on success, leaking the failing chunk's file.
-        chunk_paths.append(out_path)
 
         cmd = [
             "ffmpeg",
@@ -412,15 +471,47 @@ def _chunk_with_ffmpeg(
                 timeout=300,
             )
         except subprocess.CalledProcessError as exc:
+            # The temp file may have been partially written; remove it so
+            # we don't leak. Subsequent chunks already yielded remain the
+            # caller's responsibility.
+            if os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
             stderr_snippet = (exc.stderr or b"").decode("utf-8", errors="replace")[-500:]
             raise RuntimeError(
                 f"ffmpeg failed on chunk {i + 1}: {stderr_snippet}"
             ) from exc
 
         if progress_callback:
-            progress_callback(i + 1, num_chunks, f"Splitting audio: chunk {i + 1}/{num_chunks}")
+            progress_callback(
+                i + 1, num_chunks, f"Splitting audio: chunk {i + 1}/{num_chunks}"
+            )
 
-    return chunk_paths
+        yield out_path
+
+
+def _chunk_with_ffmpeg(
+    file_path: str,
+    progress_callback=None,
+    max_bytes: int = MAX_CHUNK_BYTES,
+    duration_seconds: float | None = None,
+) -> list[str]:
+    """List-returning wrapper around :func:`_iter_chunks_with_ffmpeg`.
+
+    Retained for callers that need the full chunk set up front (tests,
+    legacy orchestration). The streaming pipeline in ``app.py`` consumes
+    the generator directly to overlap encoding with transcription uploads.
+    """
+    return list(
+        _iter_chunks_with_ffmpeg(
+            file_path,
+            progress_callback=progress_callback,
+            max_bytes=max_bytes,
+            duration_seconds=duration_seconds,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

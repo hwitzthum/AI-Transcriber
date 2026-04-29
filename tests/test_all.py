@@ -209,6 +209,53 @@ def test_chunking_logic():
     print("\n  ✅ Chunking logic PASSED")
 
 
+def test_iter_chunks_streaming():
+    """``iter_chunks`` is the lazy variant used by the streaming pipeline.
+
+    Why a dedicated test: ``chunk_audio`` exercises the list-returning
+    code path; the streaming entry point has its own arithmetic for the
+    upfront chunk count + a generator that yields paths over time. A
+    regression in either would silently break the encode/upload overlap
+    in app.py.
+    """
+    separator("Streaming chunk iterator (iter_chunks)")
+
+    # Single-chunk path: small file at default limit yields exactly one path
+    total, it = audio_processor.iter_chunks("tests/test_english.mp3")
+    assert total == 1, f"Expected total=1 for single-chunk path, got {total}"
+    paths = list(it)
+    assert len(paths) == 1, f"Expected 1 yielded path, got {len(paths)}"
+    audio_processor.cleanup_chunks(paths, "tests/test_english.mp3")
+    print("  ✅ Single-chunk path: total=1, 1 path yielded")
+
+    # Multi-chunk path: forced tiny limit produces several chunks; the
+    # announced total must match what the iterator actually yields.
+    forced_limit = 5 * 1024
+    total, it = audio_processor.iter_chunks(
+        "tests/test_english.mp3", max_bytes=forced_limit
+    )
+    assert total > 1, f"Expected multi-chunk total, got {total}"
+
+    yielded: list[str] = []
+    for path in it:
+        # Each path must exist on disk by the time it's yielded — otherwise
+        # the streaming consumer would race ffmpeg.
+        assert os.path.exists(path), f"Yielded path does not exist: {path}"
+        yielded.append(path)
+
+    # Iterator may yield slightly fewer than ``total`` if the tail chunk
+    # is shorter than _MIN_CHUNK_SEC. It must never yield more.
+    assert len(yielded) <= total, (
+        f"Iterator yielded {len(yielded)} paths but announced total={total}"
+    )
+    assert len(yielded) >= 1, "Multi-chunk path produced zero chunks"
+
+    audio_processor.cleanup_chunks(yielded, "tests/test_english.mp3")
+    for path in yielded:
+        assert not os.path.exists(path), f"Chunk not cleaned up: {path}"
+    print(f"  ✅ Multi-chunk path: announced total={total}, yielded {len(yielded)} paths")
+
+
 def test_video_audio_extraction():
     """Verify video files are transcoded to MP3 audio via ffmpeg (the
     `_ensure_mp3` helper drops video with `-vn` and produces a speech-
