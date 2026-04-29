@@ -90,6 +90,13 @@ logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %
 logger = logging.getLogger(__name__)
 
 
+# Read the stylesheet once at module import time. Streamlit re-executes
+# the script body on every rerun (every keystroke, checkbox toggle, etc.),
+# so doing the disk read inside the body would re-read ~27 KB on every
+# user interaction. Module scope is evaluated once per worker process.
+_STYLES_CSS = (Path(__file__).parent / "assets" / "styles.css").read_text(encoding="utf-8")
+
+
 # Cached export functions
 @st.cache_data(show_spinner=False)
 def _cached_export_docx(text: str, title: str) -> bytes:
@@ -160,8 +167,7 @@ st.html(
     '&display=swap">'
 )
 
-_STYLES_PATH = Path(__file__).parent / "assets" / "styles.css"
-st.markdown(_STYLES_PATH.read_text(encoding="utf-8"), unsafe_allow_html=True)
+st.markdown(_STYLES_CSS, unsafe_allow_html=True)
 
 
 # ── Session state ────────────────────────────────────────────────────────────
@@ -409,10 +415,14 @@ if audio_file_path:
         try:
             # Step 1: Chunk the audio (using provider-specific upload ceiling).
             status_text.markdown("**Preparing audio…**")
+            # Reuse the duration from the already-cached audio info so the
+            # chunker doesn't re-spawn ffprobe just to learn the same value.
+            cached_info = st.session_state.get("audio_info") or {}
             chunk_paths = audio_processor.chunk_audio(
                 audio_file_path,
                 progress_callback=update_progress,
                 max_bytes=cloud_engine.get_max_chunk_bytes(cloud_provider),
+                duration_seconds=cached_info.get("duration_seconds"),
             )
 
             # Step 2: Transcribe (Cloud Only)

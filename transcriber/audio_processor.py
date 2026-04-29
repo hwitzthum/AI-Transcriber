@@ -6,6 +6,7 @@ to do real work if they are missing, with a clear install hint.
 """
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -151,8 +152,6 @@ def _get_audio_info_ffprobe(file_path: str) -> dict:
     Returns:
         dict with duration_seconds, duration_formatted, channels, sample_rate
     """
-    import json
-
     # Use ffprobe to get stream info in JSON format
     result = subprocess.run(
         [
@@ -223,6 +222,7 @@ def chunk_audio(
     file_path: str,
     progress_callback=None,
     max_bytes: int = MAX_CHUNK_BYTES,
+    duration_seconds: float | None = None,
 ) -> list[str]:
     """
     Prepare an audio/video file for upload to a transcription API.
@@ -236,6 +236,11 @@ def chunk_audio(
     via :func:`cleanup_chunks` — note the original path is returned
     unchanged when the input is already an MP3 below the size threshold,
     in which case ``cleanup_chunks`` will skip it.
+
+    ``duration_seconds`` is an optional optimisation: callers that already
+    have the audio's duration (from a prior :func:`get_audio_info` call)
+    can pass it in to skip a second ffprobe subprocess spawn inside the
+    chunker. Omitting it preserves the prior behaviour.
     """
     require_ffmpeg()
 
@@ -249,7 +254,12 @@ def chunk_audio(
     # Larger than the upload ceiling — slice into chunks via ffmpeg. The
     # streaming path keeps RAM usage proportional to one chunk regardless
     # of source size, so multi-hour recordings just work.
-    return _chunk_with_ffmpeg(file_path, progress_callback, max_bytes=max_bytes)
+    return _chunk_with_ffmpeg(
+        file_path,
+        progress_callback,
+        max_bytes=max_bytes,
+        duration_seconds=duration_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +320,7 @@ def _chunk_with_ffmpeg(
     file_path: str,
     progress_callback=None,
     max_bytes: int = MAX_CHUNK_BYTES,
+    duration_seconds: float | None = None,
 ) -> list[str]:
     """
     Slice a file into MP3 chunks using ffmpeg without loading it into RAM.
@@ -320,8 +331,16 @@ def _chunk_with_ffmpeg(
 
     Each chunk overlaps with the next by OVERLAP_MS milliseconds. The cloud
     engine's deduplication logic removes the repeated words after transcription.
+
+    Callers that already know the duration (from a prior ``get_audio_info``
+    call) can pass it in via ``duration_seconds`` to avoid a duplicate
+    ffprobe subprocess spawn here.
     """
-    total_seconds = _get_duration_seconds(file_path)
+    total_seconds = (
+        duration_seconds
+        if duration_seconds is not None
+        else _get_duration_seconds(file_path)
+    )
 
     # Calculate chunk and step duration to stay under max_bytes at 128 kbps
     bitrate_kbps = 128
