@@ -8,7 +8,6 @@ mlx-whisper model (optimized for Apple Silicon) or cloud APIs
 Run with: uv run streamlit run app.py
 """
 
-import hashlib
 import os
 import tempfile
 import logging
@@ -20,22 +19,23 @@ from transcriber import exporter
 from transcriber import text_processor
 
 
-def _compute_file_hash(file_buffer) -> str:
-    """Compute a fast hash of the file buffer to detect changes.
+@st.cache_data(show_spinner=False)
+def _cached_audio_info(file_path: str, mtime: float) -> dict:
+    """Streamlit-cached wrapper around audio_processor.get_audio_info.
 
-    Uses first 64KB + last 64KB + file size for speed on large files.
+    The ``mtime`` argument participates in the cache key so the cache is
+    invalidated when the on-disk file changes; it is otherwise unused.
+    Without this, ffprobe spawns a subprocess on every Streamlit rerun
+    (every checkbox click, search keystroke, etc.) — measurable lag on
+    long editing sessions.
     """
-    hasher = hashlib.md5()
-    data = file_buffer.getvalue()
+    return audio_processor.get_audio_info(file_path)
 
-    # Hash first 64KB
-    hasher.update(data[:65536])
-    # Hash last 64KB
-    hasher.update(data[-65536:])
-    # Include file size to differentiate files with same head/tail
-    hasher.update(str(len(data)).encode())
 
-    return hasher.hexdigest()
+@st.cache_data(show_spinner=False)
+def _cached_needs_chunking(file_path: str, mtime: float, max_bytes: int) -> bool:
+    """Streamlit-cached wrapper around audio_processor.needs_chunking."""
+    return audio_processor.needs_chunking(file_path, max_bytes=max_bytes)
 
 
 def _get_cached_upload_path(uploaded_file) -> str:
@@ -44,7 +44,7 @@ def _get_cached_upload_path(uploaded_file) -> str:
     Uses session state to cache the temp file path based on file content hash.
     This prevents writing duplicate temp files on every Streamlit re-run.
     """
-    file_hash = _compute_file_hash(uploaded_file)
+    file_hash = audio_processor.compute_upload_hash(uploaded_file)
     cache_key = f"_upload_cache_{file_hash}"
 
     # Check if we already have a cached path for this exact file
@@ -102,6 +102,17 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# Startup gate: ffmpeg/ffprobe are hard prerequisites. If they aren't on
+# PATH, every audio operation in the app will fail later with an opaque
+# error — surface it immediately as a clean Streamlit error instead so
+# the user knows what to install.
+try:
+    audio_processor.require_ffmpeg()
+except RuntimeError as _ffmpeg_err:
+    st.error(f"❌ {_ffmpeg_err}")
+    st.stop()
 
 # ── Custom CSS — "Studio Noir" Design System ─────────────────────────────────
 
@@ -1045,7 +1056,9 @@ elif file_path_input.strip():
 
 if audio_file_path:
     try:
-        info = audio_processor.get_audio_info(audio_file_path)
+        # mtime participates in the cache key — file change → cache miss.
+        file_mtime = os.path.getmtime(audio_file_path)
+        info = _cached_audio_info(audio_file_path, file_mtime)
         st.session_state.audio_info = info
 
         # Display audio info
@@ -1058,9 +1071,10 @@ if audio_file_path:
         # Use the chosen provider's upload limit so the "needs chunking" hint
         # only fires when this specific provider would actually need it.
         provider_max_chunk_bytes = cloud_engine.get_max_chunk_bytes(cloud_provider)
-        needs_split = audio_processor.needs_chunking(
+        needs_split = _cached_needs_chunking(
             audio_file_path,
-            max_bytes=provider_max_chunk_bytes,
+            file_mtime,
+            provider_max_chunk_bytes,
         )
         if needs_split:
             st.info("📎 This file is large and will be split into chunks for processing.")
