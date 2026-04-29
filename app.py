@@ -16,6 +16,7 @@ from pathlib import Path
 import streamlit as st
 
 from transcriber import audio_processor
+from transcriber import batch as batch_module
 from transcriber import cloud_engine
 from transcriber import exporter
 from transcriber import text_processor
@@ -388,15 +389,24 @@ col_upload, col_path = st.columns(2)
 
 with col_upload:
     st.markdown(
-        '<div class="section-eyebrow"><span class="num">01</span> Upload file</div>',
+        '<div class="section-eyebrow"><span class="num">01</span> Upload file(s)</div>',
         unsafe_allow_html=True,
     )
-    uploaded_file = st.file_uploader(
+    # ``accept_multiple_files=True`` lights up the batch path below
+    # without changing the single-file UX: when the user drops exactly
+    # one file the rest of the page behaves identically to before.
+    uploaded_files = st.file_uploader(
         "Drop your audio or video file here",
         type=["mp3", "wav", "m4a", "flac", "ogg", "wma", "aac", "opus", "webm", "mp4", "mov", "avi", "mkv"],
-        help="Supports MP3, WAV, M4A, FLAC, MP4, MOV, and more.",
+        help="Supports MP3, WAV, M4A, FLAC, MP4, MOV, and more. Drop several at once for batch transcription.",
         label_visibility="collapsed",
+        accept_multiple_files=True,
     )
+    # ``file_uploader`` returns ``[]`` (not ``None``) when nothing is
+    # selected with ``accept_multiple_files=True``. Normalise to a
+    # single ``uploaded_file`` for the existing source-resolution
+    # chain; the batch path runs separately when len > 1.
+    uploaded_file = uploaded_files[0] if uploaded_files and len(uploaded_files) == 1 else None
 
 with col_path:
     st.markdown(
@@ -481,6 +491,159 @@ if fetch_url_clicked and url_input.strip():
             download_progress.empty()
             download_status.empty()
             st.error(str(exc))
+
+
+# ── Batch transcription ────────────────────────────────────────────────────
+# Active when the uploader has more than one file. The single-file
+# resolution chain below this block (uploaded_file / path / URL) only
+# runs when there's exactly one file or no file at all, so the batch
+# path is purely additive — single-file UX is untouched.
+
+if uploaded_files and len(uploaded_files) > 1:
+    st.divider()
+    st.markdown(
+        '<div class="section-eyebrow"><span class="num">04</span> Batch transcription</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"**{len(uploaded_files)} files queued:**")
+    for _f in uploaded_files:
+        _size_mb = (_f.size or 0) / (1024 * 1024)
+        st.markdown(f"- `{_f.name}` · {_size_mb:.1f} MB")
+
+    # Cache key based on the (name, size) tuple of the queued files.
+    # Keeping previous results in session state lets the user toggle
+    # back to the page or click "Download" without retranscribing.
+    _batch_signature = tuple((f.name, f.size or 0) for f in uploaded_files)
+    _batch_cache_key = f"_batch_results_{hash(_batch_signature)}"
+
+    diarize_flag = enable_diarization if "Deepgram" in cloud_provider else False
+    threshold = (
+        low_confidence_threshold_value
+        if (highlight_low_confidence and "Deepgram" in cloud_provider)
+        else None
+    )
+
+    if _batch_cache_key not in st.session_state:
+        if not api_key or not api_key.strip():
+            st.warning("Enter your API key in the sidebar, then begin the batch.")
+        elif st.button(
+            "Begin Batch Transcription",
+            type="primary",
+            use_container_width=True,
+        ):
+            outer_progress = st.progress(0.0)
+            outer_status = st.empty()
+            inner_progress = st.progress(0.0)
+            inner_status = st.empty()
+
+            results: list[dict] = []
+
+            for i, batch_file in enumerate(uploaded_files):
+                outer_progress.progress(i / len(uploaded_files))
+                outer_status.markdown(
+                    f"**File {i + 1}/{len(uploaded_files)}: `{batch_file.name}`**"
+                )
+
+                # Materialise the upload to a temp file. We deliberately
+                # don't reuse the upload-cache machinery from the
+                # single-file path: that cache is keyed for one current
+                # upload and would thrash on a batch.
+                tmp_suffix = os.path.splitext(batch_file.name)[1]
+                tmp = tempfile.NamedTemporaryFile(suffix=tmp_suffix, delete=False)
+                tmp.write(batch_file.getbuffer())
+                tmp.close()
+
+                def _inner_progress(current, total, message, *, _ip=inner_progress, _is=inner_status):
+                    """Bind the placeholders explicitly so the closure
+                    doesn't pick up the *next* iteration's widgets."""
+                    if total > 0:
+                        _ip.progress(min(current / total, 1.0))
+                    _is.markdown(f"_{message}_")
+
+                try:
+                    file_result = batch_module.transcribe_one(
+                        audio_path=tmp.name,
+                        provider=cloud_provider,
+                        api_key=api_key.strip(),
+                        language=language_code,
+                        diarize=diarize_flag,
+                        include_timestamps=include_timestamps,
+                        low_confidence_threshold=threshold,
+                        progress_callback=_inner_progress,
+                    )
+                    results.append({
+                        "filename": batch_file.name,
+                        "text": file_result.get("text", "") or "",
+                        "detected_language": file_result.get("detected_language"),
+                        "duration_seconds": file_result.get("duration_seconds") or 0.0,
+                        "failed_chunks": file_result.get("failed_chunks") or [],
+                        "quality_warnings": file_result.get("quality_warnings") or [],
+                        "error": None,
+                    })
+                except Exception as exc:  # noqa: BLE001 — record + continue
+                    results.append({
+                        "filename": batch_file.name,
+                        "text": "",
+                        "error": cloud_engine.redact_secrets(str(exc)),
+                    })
+                    logger.exception("Batch transcription failed for %s", batch_file.name)
+                finally:
+                    if os.path.exists(tmp.name):
+                        try:
+                            os.unlink(tmp.name)
+                        except OSError:
+                            pass
+
+            outer_progress.progress(1.0)
+            outer_status.markdown("**Batch complete.**")
+            inner_progress.empty()
+            inner_status.empty()
+
+            st.session_state[_batch_cache_key] = results
+            st.rerun()
+
+    if _batch_cache_key in st.session_state:
+        cached_results = st.session_state[_batch_cache_key]
+
+        st.markdown("**Per-file results:**")
+        for r in cached_results:
+            if r.get("error"):
+                st.error(f"`{r['filename']}` · {r['error']}")
+                continue
+            lang = r.get("detected_language") or "?"
+            wc = len((r.get("text") or "").split())
+            dur = r.get("duration_seconds") or 0.0
+            warn = r.get("quality_warnings") or []
+            failed = r.get("failed_chunks") or []
+            line = (
+                f"`{r['filename']}` · {wc:,} words · "
+                f"{dur:.0f}s · language: {lang}"
+            )
+            if failed or warn:
+                line += f" · {len(warn) + len(failed)} warning(s)"
+                st.warning(line)
+            else:
+                st.success(line)
+
+        zip_bytes = batch_module.build_zip(cached_results)
+        col_dl, col_clear = st.columns([3, 1])
+        with col_dl:
+            st.download_button(
+                label=f"Download · ZIP ({len(cached_results)} transcripts)",
+                data=zip_bytes,
+                file_name="transcripts.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        with col_clear:
+            if st.button("Clear results", use_container_width=True):
+                del st.session_state[_batch_cache_key]
+                st.rerun()
+
+    # Bail out before the single-file pipeline below — there's no
+    # single ``uploaded_file`` to feed it, and the editor / single-file
+    # exports don't have a defined meaning for >1 file.
+    st.stop()
 
 
 # ── Resolve the audio source ────────────────────────────────────────────────
