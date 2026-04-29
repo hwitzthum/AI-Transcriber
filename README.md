@@ -13,6 +13,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 - **Large file support** — Automatic chunking and memory-efficient streaming for files of any size
 - **Video support** — Extracts audio from MP4, MOV, AVI, MKV, and more
 - **URL input** — Paste a YouTube, podcast, or direct media URL; the audio is downloaded and transcribed without leaving the app
+- **Batch transcription** — Drop several files at once; each is transcribed in sequence and the results are bundled into a single zip download (DOCX + PDF + TXT per file)
 - **All audio formats** — MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, WEBM, and more
 
 ### Output Quality
@@ -138,11 +139,15 @@ Paragraphs are automatically inserted at:
 ### 4. Provide Your Audio
 
 Three options:
-- **Drag and drop** a file into the upload area
+- **Drag and drop** one or more files into the upload area
 - **Paste a file path** (e.g., `/Users/you/meeting.mp4`) into the path field
 - **Paste a URL** (YouTube video, podcast episode, or direct media link) and click **Fetch URL**
 
 For uploads and paths, audio info (duration, size, sample rate) is displayed immediately. For URLs, click **Fetch URL** first; the audio is downloaded into a temp file via yt-dlp + ffmpeg, then audio info appears. Large files will be split into chunks automatically — you will see a notice.
+
+#### Batch mode
+
+Drop **two or more files** into the uploader to switch to batch mode automatically. The page shows a queue, and clicking **Begin Batch Transcription** runs every file through the same pipeline (chunking, transcription, optional diarization / timestamps / confidence highlighting). When all files are done, you get a single **ZIP** download containing `<filename>/transcription.docx`, `.pdf`, and `.txt` for each successfully processed file (failed files get an `error.txt` instead, so it's obvious which entry is which).
 
 ---
 
@@ -218,6 +223,7 @@ Transcriber/
 │   ├── __init__.py
 │   ├── audio_processor.py   # Format conversion, chunking, ffprobe metadata
 │   ├── cloud_engine.py      # OpenAI / Groq / Deepgram API, retry logic, deduplication
+│   ├── batch.py             # Batch transcription helpers and zip builder
 │   ├── exporter.py          # DOCX and PDF export with speaker formatting
 │   ├── language.py          # ISO-639-1 normalization for detected languages
 │   ├── text_processor.py    # Filler detection, speaker renaming, search highlight
@@ -226,8 +232,11 @@ Transcriber/
 │   ├── test_all.py            # Core test suite (audio, chunking, export)
 │   ├── test_cloud_engine.py   # Cloud engine unit tests (retry, dedup, garbage detection)
 │   ├── test_language.py       # Language code normalization
+│   ├── test_batch.py          # Batch helpers (zip layout, chunk cleanup)
+│   ├── test_confidence_highlight.py
 │   ├── test_redact_secrets.py # Verifies API keys are stripped from error messages
 │   ├── test_text_processor.py
+│   ├── test_timestamps.py     # Timestamped-output pipeline tests
 │   ├── test_url_source.py     # yt-dlp wrapper unit tests (mocked)
 │   └── _make_test_video.py    # Manual fixture regen (not run by pytest)
 ├── pyproject.toml
