@@ -94,6 +94,42 @@ def _cached_export_pdf(text: str, title: str) -> bytes:
     return exporter.export_pdf(text, title=title)
 
 
+# Whisper returns full language names ("french"), Deepgram returns ISO-639-1
+# codes ("fr"). Map both forms to a canonical ISO-2 code so we can compare
+# against the dropdown selection.
+_LANGUAGE_NAME_TO_ISO = {
+    "english": "en",
+    "german": "de",
+    "deutsch": "de",
+    "french": "fr",
+    "français": "fr",
+    "francais": "fr",
+    "spanish": "es",
+    "español": "es",
+    "espanol": "es",
+    "italian": "it",
+    "italiano": "it",
+}
+
+
+def _normalize_language_to_iso(value: str | None) -> str | None:
+    """Return a 2-letter ISO code for a Whisper/Deepgram language string, or None.
+
+    Accepts ISO codes ("fr", "fr-FR") and full names ("French"). Unknown values
+    return None so callers can fall back to displaying the raw string.
+    """
+    if not value:
+        return None
+    v = value.strip().lower()
+    if not v:
+        return None
+    # Strip locale suffix (e.g. "fr-FR" → "fr") and check ISO-2 form first.
+    head = v.split("-", 1)[0]
+    if len(head) == 2 and head.isalpha():
+        return head
+    return _LANGUAGE_NAME_TO_ISO.get(v)
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -922,11 +958,11 @@ with st.sidebar:
 
     # Language selection
     st.divider()
-    st.markdown("### Language")
+    st.markdown("### Spoken language")
 
     # Standard languages list (simplified for cloud)
     LANGUAGES = {
-        "Auto-detect": None,
+        "Auto-detect (recommended)": None,
         "English": "en",
         "German": "de",
         "French": "fr",
@@ -935,12 +971,26 @@ with st.sidebar:
     }
 
     language_name = st.selectbox(
-        "Audio language",
+        "Spoken language in the audio",
         list(LANGUAGES.keys()),
-        help="Choose the language or let the AI detect it automatically.",
+        help=(
+            "The language *spoken in your recording* — not the output language. "
+            "The transcript is always produced in the original language; nothing is translated. "
+            "If you pick the wrong language here, the transcript will be garbled. "
+            "When in doubt, leave this on Auto-detect. "
+            "For audio that mixes multiple languages, switch the provider above to "
+            "Deepgram Nova-3 (Multilingual)."
+        ),
         label_visibility="collapsed",
     )
     language_code = LANGUAGES[language_name]
+    st.markdown(
+        '<p style="font-size: 0.75rem; color: #71717a; margin-top: 4px;">'
+        "Transcribed in the original language — never translated. "
+        "For mixed-language audio, use Nova-3 (Multilingual)."
+        "</p>",
+        unsafe_allow_html=True,
+    )
 
     # Footer
     st.divider()
@@ -1142,9 +1192,21 @@ if audio_file_path:
             progress_bar.progress(1.0)
             status_text.markdown("✅ **Transcription complete!**")
 
-            # Show detected language if auto-detect was used
-            if detected_language and not language_code:
-                st.info(f"Detected language: **{detected_language.upper()}**")
+            # Show detected language if auto-detect was used,
+            # or warn the user when their forced selection disagrees with what
+            # the API actually heard (the classic "I picked German but the audio
+            # is French → garbled output" trap).
+            if detected_language:
+                detected_iso = _normalize_language_to_iso(detected_language)
+                if not language_code:
+                    label = detected_iso.upper() if detected_iso else detected_language.upper()
+                    st.info(f"Detected language: **{label}**")
+                elif detected_iso and detected_iso != language_code:
+                    st.warning(
+                        f"⚠️ You selected **{language_name}** but the audio sounds like "
+                        f"**{detected_iso.upper()}**. The transcript may be garbled. "
+                        "Re-run with Auto-detect, or pick the matching language."
+                    )
 
             # Warn about any chunks that failed (graceful degradation)
             if failed_chunks:
