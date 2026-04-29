@@ -70,6 +70,19 @@ def test_retry_predicate():
         print(f"    {status} '{str(exc)[:40]}...' -> retry={result}")
         assert not result, f"Should NOT retry on: {exc}"
 
+    # --- Substring false-positives (must NOT retry just because "400"/"429"
+    # appears inside a larger token like "14002" or "stream id 4291"). ---
+    embedded_substring_cases = [
+        Exception("Server returned status 14002"),
+        Exception("error in stream id 4291 but otherwise fine"),
+    ]
+    print("\n  Testing substring false-positives (should NOT retry):")
+    for exc in embedded_substring_cases:
+        result = cloud_engine._is_retriable_error(exc)
+        status = "✅" if not result else "❌"
+        print(f"    {status} '{str(exc)[:40]}...' -> retry={result}")
+        assert not result, f"Should NOT retry on embedded-substring: {exc}"
+
     print("\n  ✅ Smart retry predicate PASSED")
 
 
@@ -276,6 +289,128 @@ def test_find_overlap_length():
     # This is expected behavior
 
     print("\n  ✅ Overlap length detection PASSED")
+
+
+class _Obj:
+    """Lightweight stand-in for SDK response objects.
+
+    Deepgram's response objects expose nested fields via attribute access,
+    so a tiny namespace class is enough to exercise the formatters without
+    importing the SDK or hitting the network.
+    """
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+def test_format_diarized_from_paragraphs():
+    """Paragraphs path: each paragraph becomes its own **Speaker N:** block,
+    sentence text is joined with smart_format punctuation preserved."""
+    separator("Deepgram Paragraphs Formatter")
+
+    alt = _Obj(paragraphs=_Obj(paragraphs=[
+        _Obj(speaker=0, sentences=[
+            _Obj(text="Hello, how are you today?"),
+            _Obj(text="I hope you are well."),
+        ]),
+        _Obj(speaker=1, sentences=[
+            _Obj(text="I'm doing great, thanks!"),
+        ]),
+        _Obj(speaker=0, sentences=[
+            _Obj(text="Glad to hear it."),
+        ]),
+    ]))
+    result = cloud_engine._format_diarized_from_paragraphs(alt)
+    print(f"  Output:\n{result}")
+    assert "**Speaker 0:**" in result
+    assert "**Speaker 1:**" in result
+    # Smart-format punctuation must survive the join
+    assert "Hello, how are you today?" in result
+    assert "I'm doing great, thanks!" in result
+    # Each paragraph should produce its own block — three blocks total
+    assert result.count("**Speaker") == 3
+    print("  ✅ Paragraphs formatter works")
+
+
+def test_format_diarized_from_paragraphs_empty():
+    """Missing or empty paragraphs returns None so the caller can fall back."""
+    separator("Deepgram Paragraphs Empty / Missing")
+
+    # No paragraphs attribute at all
+    assert cloud_engine._format_diarized_from_paragraphs(_Obj()) is None
+    # paragraphs object but empty list
+    assert cloud_engine._format_diarized_from_paragraphs(
+        _Obj(paragraphs=_Obj(paragraphs=[]))
+    ) is None
+    # paragraphs with no speaker
+    assert cloud_engine._format_diarized_from_paragraphs(
+        _Obj(paragraphs=_Obj(paragraphs=[_Obj(speaker=None, sentences=[])]))
+    ) is None
+    print("  ✅ Empty/missing paragraphs return None")
+
+
+def test_format_diarized_from_words_fallback():
+    """Word-loop fallback: speaker change starts a new block, long pauses also."""
+    separator("Deepgram Words Fallback Formatter")
+
+    alt = _Obj(words=[
+        _Obj(speaker=0, start=0.0, end=0.5, punctuated_word="Hello,"),
+        _Obj(speaker=0, start=0.6, end=1.0, punctuated_word="world."),
+        # Speaker change → new block
+        _Obj(speaker=1, start=1.5, end=2.0, punctuated_word="Hi"),
+        _Obj(speaker=1, start=2.1, end=2.5, punctuated_word="there."),
+        # 2-second pause → new block (pause > 1.5s threshold)
+        _Obj(speaker=1, start=4.5, end=5.0, punctuated_word="Sorry,"),
+        _Obj(speaker=1, start=5.1, end=5.5, punctuated_word="continuing."),
+    ])
+    result = cloud_engine._format_diarized_from_words(alt)
+    print(f"  Output:\n{result}")
+    assert result.count("**Speaker 0:**") == 1
+    # Two blocks for speaker 1: one for "Hi there." and one after the pause
+    assert result.count("**Speaker 1:**") == 2
+    print("  ✅ Word-loop fallback works")
+
+
+def test_format_diarized_from_words_empty():
+    """Empty/missing words returns empty string."""
+    assert cloud_engine._format_diarized_from_words(_Obj()) == ""
+    assert cloud_engine._format_diarized_from_words(_Obj(words=[])) == ""
+    print("  ✅ Empty words returns ''")
+
+
+def test_provider_max_chunk_bytes():
+    """Each provider exposes its own upload ceiling.
+
+    OpenAI/Groq cap at ~25 MB; Deepgram allows up to 500 MB in one chunk
+    so most real-world meetings can be uploaded without chunking at all.
+    """
+    separator("Per-Provider Max Chunk Bytes")
+
+    openai_limit = cloud_engine.get_max_chunk_bytes("OpenAI Whisper API")
+    groq_limit = cloud_engine.get_max_chunk_bytes("Groq (whisper-large-v3-turbo)")
+    deepgram_limit = cloud_engine.get_max_chunk_bytes("Deepgram Nova-2")
+    deepgram_multi = cloud_engine.get_max_chunk_bytes("Deepgram Nova-3 (Multilingual)")
+    unknown_limit = cloud_engine.get_max_chunk_bytes("not-a-real-provider")
+
+    print(f"  OpenAI:           {openai_limit / 1024 / 1024:.0f} MB")
+    print(f"  Groq:             {groq_limit / 1024 / 1024:.0f} MB")
+    print(f"  Deepgram Nova-2:  {deepgram_limit / 1024 / 1024:.0f} MB")
+    print(f"  Deepgram Nova-3:  {deepgram_multi / 1024 / 1024:.0f} MB")
+    print(f"  Unknown provider: {unknown_limit / 1024 / 1024:.0f} MB")
+
+    assert openai_limit == 24 * 1024 * 1024, "OpenAI limit must be 24 MB"
+    assert groq_limit == 24 * 1024 * 1024, "Groq limit must be 24 MB"
+    assert deepgram_limit == 500 * 1024 * 1024, "Deepgram limit must be 500 MB"
+    assert deepgram_multi == 500 * 1024 * 1024, "Deepgram multilingual must be 500 MB"
+    # Unknown providers fall back to the conservative OpenAI/Groq ceiling
+    # so we never accidentally upload an oversized chunk.
+    assert unknown_limit == 24 * 1024 * 1024, "Unknown provider must default to safe limit"
+
+    # Deepgram limit must be at least an order of magnitude larger than the
+    # OpenAI/Groq limit — otherwise the per-provider strategy isn't earning
+    # its complexity.
+    assert deepgram_limit >= openai_limit * 10
+    print("  ✅ Per-provider chunk limits configured correctly")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,17 @@
-"""Audio processing: format detection, conversion, and chunking for large files."""
+"""Audio processing: format detection, conversion, and chunking for large files.
 
+ffmpeg/ffprobe are hard requirements — see README for installation. The
+module checks for them at startup via :func:`require_ffmpeg` and refuses
+to do real work if they are missing, with a clear install hint.
+"""
+
+import hashlib
 import logging
+import math
 import os
 import subprocess
 import tempfile
-import math
 from pathlib import Path
-from pydub import AudioSegment
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -20,24 +25,66 @@ MAX_CHUNK_BYTES = 24 * 1024 * 1024
 # join point without excessive repetition.
 OVERLAP_MS = 5000
 
-# Files larger than this threshold (in MB) trigger the ffmpeg-direct chunking
-# path to avoid loading the entire file into RAM with pydub.
-# At 128 kbps MP3, 200 MB is roughly 3+ hours of audio.
-_LARGE_FILE_THRESHOLD_MB = 200
-
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac",
     ".opus", ".webm", ".mp4", ".mov", ".avi", ".mkv",
 }
 
+# Sensitive filesystem locations the user-facing path input must never resolve
+# into. The check is post-realpath, so symlink traversal can't bypass it.
+# Why a deny-list rather than an allow-list: legitimate audio files live in
+# many places on a personal machine (~/Documents, /Volumes/<drive>, /tmp).
+# An allow-list would force users to configure roots; a deny-list blocks the
+# obvious exfiltration targets while keeping the local-use ergonomics.
+_DENIED_PATH_PREFIXES = (
+    "/etc",
+    "/private/etc",
+    "/root",
+    "/var/root",
+    "/sys",
+    "/proc",
+    "/private/var/db",
+    "/private/var/root",
+)
+_DENIED_PATH_SUBSTRINGS = (
+    "/.ssh/",
+    "/.aws/",
+    "/.gnupg/",
+    "/.config/gh/",
+    "/.docker/",
+    "/.kube/",
+)
+
 
 def validate_file(file_path: str) -> tuple[bool, str]:
-    """Validate that a file exists and is a supported audio format."""
+    """Validate that a file exists and is a supported audio format.
+
+    Resolves symlinks before checking, then rejects paths that point at
+    sensitive system locations or user secret directories. This is a
+    defense-in-depth measure for the "Or Enter Path" UI input — without it,
+    a user-supplied path would be passed straight to ffprobe/ffmpeg and any
+    file the process could read would be uploaded to the transcription API.
+    """
     path = Path(file_path)
     if not path.exists():
         return False, f"File not found: {file_path}"
     if not path.is_file():
         return False, f"Not a file: {file_path}"
+
+    # Canonicalize: follow symlinks and resolve "..", so a path like
+    # "/Users/x/audio/../../../etc/passwd" cannot sneak past the deny-list.
+    try:
+        resolved = str(path.resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        return False, f"Could not resolve path: {exc}"
+
+    for prefix in _DENIED_PATH_PREFIXES:
+        if resolved == prefix or resolved.startswith(prefix + "/"):
+            return False, "Access denied: path resolves to a protected location."
+    for needle in _DENIED_PATH_SUBSTRINGS:
+        if needle in resolved:
+            return False, "Access denied: path resolves to a protected location."
+
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
         return False, (
             f"Unsupported format: {path.suffix}. "
@@ -49,45 +96,53 @@ def validate_file(file_path: str) -> tuple[bool, str]:
 def get_audio_info(file_path: str) -> dict:
     """Get audio file metadata using ffprobe (memory-efficient).
 
-    Uses ffprobe to read only the container/stream headers without decoding
-    the entire file into RAM. This is essential for multi-hour recordings
-    where pydub would allocate gigabytes of memory just to read metadata.
-
-    Falls back to pydub if ffprobe is not available.
+    Reads only the container/stream headers; never decodes the file. This
+    is essential for multi-hour recordings where any in-RAM decoder would
+    allocate gigabytes just to report duration and sample rate.
     """
+    require_ffmpeg()
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    info = _get_audio_info_ffprobe(file_path)
+    info["file_size_mb"] = file_size_mb
+    return info
 
-    # Try ffprobe first (O(1) memory, reads only headers)
-    if _ffprobe_available():
-        try:
-            info = _get_audio_info_ffprobe(file_path)
-            info["file_size_mb"] = file_size_mb
-            return info
-        except Exception as e:
-            logger.warning("ffprobe failed, falling back to pydub: %s", e)
 
-    # Fallback: pydub (loads entire file into RAM)
-    audio = AudioSegment.from_file(file_path)
-    return {
-        "duration_seconds": len(audio) / 1000.0,
-        "duration_formatted": _format_duration(len(audio) / 1000.0),
-        "channels": audio.channels,
-        "sample_rate": audio.frame_rate,
-        "file_size_mb": file_size_mb,
-    }
+_FFPROBE_AVAILABLE: bool | None = None
+_FFMPEG_AVAILABLE: bool | None = None
+
+
+def require_ffmpeg() -> None:
+    """Raise a RuntimeError with install hints if ffmpeg/ffprobe are missing.
+
+    Both binaries are hard prerequisites for transcoding, chunking, and
+    reading metadata. The earlier pydub fallback path was a partial
+    illusion — pydub itself shells out to ffmpeg for every format this
+    app supports — so a single, explicit gate produces a clearer error.
+    """
+    if not _ffmpeg_available() or not _ffprobe_available():
+        raise RuntimeError(
+            "ffmpeg and ffprobe are required but were not found on PATH. "
+            "Install with `brew install ffmpeg` (macOS) or "
+            "`sudo apt install ffmpeg` (Debian/Ubuntu)."
+        )
 
 
 def _ffprobe_available() -> bool:
-    """Check if ffprobe is available on PATH."""
-    try:
-        subprocess.run(
-            ["ffprobe", "-version"],
-            capture_output=True,
-            check=True,
-        )
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
+    """Check if ffprobe is available on PATH (memoised — the subprocess
+    spawn used to add ~30–50 ms per call, and it's called several times
+    per upload)."""
+    global _FFPROBE_AVAILABLE
+    if _FFPROBE_AVAILABLE is None:
+        try:
+            subprocess.run(
+                ["ffprobe", "-version"],
+                capture_output=True,
+                check=True,
+            )
+            _FFPROBE_AVAILABLE = True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            _FFPROBE_AVAILABLE = False
+    return _FFPROBE_AVAILABLE
 
 
 def _get_audio_info_ffprobe(file_path: str) -> dict:
@@ -140,101 +195,61 @@ def _get_audio_info_ffprobe(file_path: str) -> dict:
     }
 
 
-def needs_chunking(file_path: str) -> bool:
-    """Check if the file exceeds the chunk size limit."""
-    return os.path.getsize(file_path) > MAX_CHUNK_BYTES
+def compute_upload_hash(file_buffer) -> str:
+    """Fingerprint an upload buffer without copying its bytes.
 
-
-def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
+    Uses ``getbuffer()`` (a zero-copy memoryview) instead of ``getvalue()``
+    (which materialises the entire upload into a fresh bytes object) so a
+    multi-hundred-megabyte file doesn't allocate a fresh copy on every
+    Streamlit rerun. Hashes head + tail + size — same fingerprint as
+    before, the change is purely about memory.
     """
-    Split a large audio file into smaller chunks suitable for API upload.
+    hasher = hashlib.md5()
+    buf = file_buffer.getbuffer()
+    size = len(buf)
+    # Slicing a memoryview is O(1); .update accepts buffer protocol directly.
+    hasher.update(buf[:65536])
+    hasher.update(buf[-65536:])
+    hasher.update(str(size).encode())
+    return hasher.hexdigest()
 
-    For very large files (> _LARGE_FILE_THRESHOLD_MB) the function uses
-    ffmpeg directly to extract and slice audio without loading the entire
-    file into Python memory. This keeps RAM usage nearly constant regardless
-    of input file size and is critical for multi-hour recordings.
 
-    For smaller files pydub is used (same behaviour as before).
+def needs_chunking(file_path: str, max_bytes: int = MAX_CHUNK_BYTES) -> bool:
+    """Check if the file exceeds the chunk size limit for the chosen provider."""
+    return os.path.getsize(file_path) > max_bytes
 
-    Returns a list of temporary MP3 file paths. The caller is responsible for
-    cleaning them up via cleanup_chunks().
+
+def chunk_audio(
+    file_path: str,
+    progress_callback=None,
+    max_bytes: int = MAX_CHUNK_BYTES,
+) -> list[str]:
     """
+    Prepare an audio/video file for upload to a transcription API.
+
+    Files at or below ``max_bytes`` are returned as a single-element list
+    (transcoded to MP3 by ffmpeg if not already MP3); larger files are
+    sliced into ``max_bytes``-sized MP3 chunks streamed through ffmpeg
+    without ever loading the source into RAM.
+
+    Returns a list of file paths. Callers must clean up the returned files
+    via :func:`cleanup_chunks` — note the original path is returned
+    unchanged when the input is already an MP3 below the size threshold,
+    in which case ``cleanup_chunks`` will skip it.
+    """
+    require_ffmpeg()
+
     file_size = os.path.getsize(file_path)
-    file_size_mb = file_size / (1024 * 1024)
-    is_video = Path(file_path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-    # --- Path 1: Very large files — stream directly through ffmpeg ---
-    # This avoids loading gigabytes of audio into RAM and is essential for
-    # multi-hour German/French conference recordings.
-    if file_size_mb > _LARGE_FILE_THRESHOLD_MB and _ffmpeg_available():
-        logger.info(
-            "File is %.0f MB (> %d MB threshold). Using ffmpeg streaming path.",
-            file_size_mb,
-            _LARGE_FILE_THRESHOLD_MB,
-        )
-        return _chunk_with_ffmpeg(file_path, progress_callback)
-
-    # --- Path 2: Medium-large video — extract audio first ---
-    # For videos between 50 MB and the large threshold, extract audio track
-    # before chunking so pydub doesn't decode video frames into RAM.
-    temp_audio_path = None
-    processed_path = file_path
-
-    if is_video and file_size_mb > 50:
-        try:
-            temp_audio_path = _extract_audio_from_video(file_path)
-            processed_path = temp_audio_path
-            file_size = os.path.getsize(processed_path)
-        except Exception as exc:
-            logger.warning("Could not extract audio from video, falling back: %s", exc)
-
-    # If file fits in one chunk (after possible audio extraction), skip splitting
-    if file_size <= MAX_CHUNK_BYTES:
-        if temp_audio_path:
-            return [temp_audio_path]
+    # File already fits in one upload — skip chunking, just transcode to MP3
+    # if needed. This is the dominant path for Deepgram (500 MB ceiling).
+    if file_size <= max_bytes:
         return [_ensure_mp3(file_path)]
 
-    # --- Path 3: Standard pydub chunking for smaller files ---
-    audio = AudioSegment.from_file(processed_path)
-    total_duration_ms = len(audio)
-
-    # Estimate chunk duration to stay under MAX_CHUNK_BYTES at 128 kbps
-    bitrate_kbps = 128
-    bytes_per_ms = (bitrate_kbps * 1000) / 8 / 1000
-    chunk_duration_ms = int(MAX_CHUNK_BYTES / bytes_per_ms)
-
-    # Safety: chunk duration must be larger than overlap
-    chunk_duration_ms = max(chunk_duration_ms, OVERLAP_MS + 1000)
-
-    step_ms = chunk_duration_ms - OVERLAP_MS
-    num_chunks = max(1, math.ceil(total_duration_ms / step_ms))
-    chunk_paths = []
-
-    for i in range(num_chunks):
-        start_ms = i * step_ms
-        end_ms = min(start_ms + chunk_duration_ms, total_duration_ms)
-
-        chunk = audio[start_ms:end_ms]
-
-        with tempfile.NamedTemporaryFile(
-            suffix=f"_chunk_{i:03d}.mp3",
-            delete=False,
-            dir=tempfile.gettempdir(),
-        ) as tmp:
-            chunk.export(tmp.name, format="mp3", bitrate="128k")
-            chunk_paths.append(tmp.name)
-
-        if progress_callback:
-            progress_callback(i + 1, num_chunks, f"Splitting audio: chunk {i + 1}/{num_chunks}")
-
-    # Clean up the intermediate audio extract if we created one
-    if temp_audio_path and os.path.exists(temp_audio_path):
-        try:
-            os.unlink(temp_audio_path)
-        except OSError as exc:
-            logger.warning("Failed to cleanup temp audio file %s: %s", temp_audio_path, exc)
-
-    return chunk_paths
+    # Larger than the upload ceiling — slice into chunks via ffmpeg. The
+    # streaming path keeps RAM usage proportional to one chunk regardless
+    # of source size, so multi-hour recordings just work.
+    return _chunk_with_ffmpeg(file_path, progress_callback, max_bytes=max_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -242,17 +257,20 @@ def chunk_audio(file_path: str, progress_callback=None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _ffmpeg_available() -> bool:
-    """Return True if ffmpeg is available on PATH."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+    """Return True if ffmpeg is available on PATH (memoised — see ffprobe)."""
+    global _FFMPEG_AVAILABLE
+    if _FFMPEG_AVAILABLE is None:
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            _FFMPEG_AVAILABLE = result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            _FFMPEG_AVAILABLE = False
+    return _FFMPEG_AVAILABLE
 
 
 def _get_duration_seconds(file_path: str) -> float:
@@ -281,7 +299,11 @@ def _get_duration_seconds(file_path: str) -> float:
         )
 
 
-def _chunk_with_ffmpeg(file_path: str, progress_callback=None) -> list[str]:
+def _chunk_with_ffmpeg(
+    file_path: str,
+    progress_callback=None,
+    max_bytes: int = MAX_CHUNK_BYTES,
+) -> list[str]:
     """
     Slice a file into MP3 chunks using ffmpeg without loading it into RAM.
 
@@ -294,10 +316,10 @@ def _chunk_with_ffmpeg(file_path: str, progress_callback=None) -> list[str]:
     """
     total_seconds = _get_duration_seconds(file_path)
 
-    # Calculate chunk and step duration to stay under MAX_CHUNK_BYTES at 128 kbps
+    # Calculate chunk and step duration to stay under max_bytes at 128 kbps
     bitrate_kbps = 128
     bytes_per_second = (bitrate_kbps * 1000) / 8
-    chunk_duration_sec = MAX_CHUNK_BYTES / bytes_per_second
+    chunk_duration_sec = max_bytes / bytes_per_second
     overlap_sec = OVERLAP_MS / 1000.0
     step_sec = chunk_duration_sec - overlap_sec
 
@@ -366,27 +388,50 @@ def _chunk_with_ffmpeg(file_path: str, progress_callback=None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# pydub helpers
+# Single-file transcoding helper
 # ---------------------------------------------------------------------------
 
-def _extract_audio_from_video(video_path: str) -> str:
-    """Extract audio track from video to a temporary MP3 file using pydub/ffmpeg."""
-    audio = AudioSegment.from_file(video_path, format=Path(video_path).suffix[1:])
-
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=tempfile.gettempdir()) as tmp:
-        audio.export(tmp.name, format="mp3", bitrate="128k")
-        return tmp.name
-
-
 def _ensure_mp3(file_path: str) -> str:
-    """Convert file to MP3 if it is not already. Returns path to the MP3 file."""
+    """Transcode any supported audio/video file to MP3 via ffmpeg.
+
+    Returns the original path unchanged when the input is already MP3,
+    avoiding a needless re-encode of files that providers can ingest
+    directly. Otherwise produces a temporary 128 kbps mono 16 kHz MP3
+    optimised for speech transcription, drops any video stream with
+    ``-vn``, and returns the output path.
+    """
     if file_path.lower().endswith(".mp3"):
         return file_path
 
-    audio = AudioSegment.from_file(file_path)
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=tempfile.gettempdir()) as tmp:
-        audio.export(tmp.name, format="mp3", bitrate="128k")
-        return tmp.name
+    require_ffmpeg()
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".mp3", delete=False, dir=tempfile.gettempdir()
+    ) as tmp:
+        out_path = tmp.name
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", file_path,
+        "-vn",                      # drop any video stream
+        "-acodec", "libmp3lame",
+        "-ab", "128k",
+        "-ar", "16000",             # 16 kHz mono is plenty for speech recognition
+        "-ac", "1",
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if os.path.exists(out_path):
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"ffmpeg failed to transcode {file_path!r}: {result.stderr.strip()[:500]}"
+        )
+    return out_path
 
 
 def cleanup_chunks(chunk_paths: list[str], original_path: str):

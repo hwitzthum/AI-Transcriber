@@ -9,10 +9,11 @@ dependencies = [
     "fpdf2>=2.8.5",
     "groq>=1.0.0",
     "openai>=2.21.0",
-    "pydub>=0.25.1",
     "python-docx>=1.2.0",
     "streamlit>=1.54.0",
 ]
+# Note: ffmpeg and ffprobe are required system binaries (not Python deps).
+# Install with: `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux).
 
 [project.optional-dependencies]
 dev = [

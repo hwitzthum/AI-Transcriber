@@ -47,11 +47,21 @@ def _is_retriable_error(exc: BaseException) -> bool:
     - 403 Forbidden (access denied)
     - 404 Not Found
     """
-    exc_str = str(exc).lower()
+    exc_str_raw = str(exc)
+    exc_str = exc_str_raw.lower()
 
-    # Check for explicit retriable status codes in the error message
+    # Non-retriable status codes are checked FIRST, with word boundaries, so
+    # that an embedded substring like "400" inside a larger number (e.g.
+    # "14002") never falsely classifies as retriable. Use \b to anchor on
+    # whole numeric tokens.
+    _NON_RETRIABLE_CODES = (400, 401, 403, 404)
+    for code in _NON_RETRIABLE_CODES:
+        if re.search(rf"\b{code}\b", exc_str_raw):
+            return False
+
+    # Retriable status codes — also word-boundary anchored to avoid embedded matches.
     for code in _RETRIABLE_STATUS_CODES:
-        if str(code) in str(exc):
+        if re.search(rf"\b{code}\b", exc_str_raw):
             return True
 
     # Check for common retriable error patterns
@@ -76,21 +86,17 @@ def _is_retriable_error(exc: BaseException) -> bool:
     if any(pattern in exc_str for pattern in retriable_patterns):
         return True
 
-    # Check for non-retriable patterns - if found, don't retry
+    # Check for non-retriable text patterns (the numeric codes are already handled above).
     non_retriable_patterns = [
-        "401",
         "unauthorized",
         "invalid api key",
         "authentication",
-        "400",
         "bad request",
         "invalid audio",
         "unsupported format",
         "file too large",
-        "403",
         "forbidden",
         "access denied",
-        "404",
         "not found",
     ]
 
@@ -114,28 +120,52 @@ def _is_retriable_error(exc: BaseException) -> bool:
     return False
 
 
+# OpenAI and Groq cap upload size at ~25 MB; Deepgram accepts up to ~2 GB
+# but we cap our single-chunk path at 500 MB so a network blip during a
+# very long upload only forces *one* chunk worth of re-transmission rather
+# than the whole file. 500 MB is roughly 9 hours of 128 kbps mono speech,
+# which covers nearly every real-world meeting in a single chunk.
+_OPENAI_GROQ_MAX_CHUNK_BYTES = 24 * 1024 * 1024
+_DEEPGRAM_MAX_CHUNK_BYTES = 500 * 1024 * 1024
+
 # Cloud provider configurations
 PROVIDERS = {
     "OpenAI Whisper API": {
         "description": "High accuracy, $0.006/min",
         "model": "whisper-1",
+        "max_chunk_bytes": _OPENAI_GROQ_MAX_CHUNK_BYTES,
     },
     "Groq (whisper-large-v3-turbo)": {
         "description": "Very fast, free tier available",
         "model": "whisper-large-v3-turbo",
+        "max_chunk_bytes": _OPENAI_GROQ_MAX_CHUNK_BYTES,
     },
     "Deepgram Nova-2": {
         "description": "Fast, supports **Speaker Diarization**",
         "model": "nova-2",
         "diarization": True,
+        "max_chunk_bytes": _DEEPGRAM_MAX_CHUNK_BYTES,
     },
     "Deepgram Nova-3 (Multilingual)": {
         "description": "Best for **multilingual** audio, supports diarization",
         "model": "nova-3",
         "diarization": True,
         "multilingual": True,
+        "max_chunk_bytes": _DEEPGRAM_MAX_CHUNK_BYTES,
     },
 }
+
+
+def get_max_chunk_bytes(provider: str) -> int:
+    """Return the upload size ceiling (in bytes) for a given provider.
+
+    Falls back to the conservative OpenAI/Groq limit for unknown providers
+    so callers never get an over-large chunk by accident.
+    """
+    config = PROVIDERS.get(provider)
+    if not config:
+        return _OPENAI_GROQ_MAX_CHUNK_BYTES
+    return int(config.get("max_chunk_bytes", _OPENAI_GROQ_MAX_CHUNK_BYTES))
 
 # Minimum non-trivial word count to consider a chunk transcript valid.
 # Chunks that produce fewer words than this are flagged as potentially garbage.
@@ -593,70 +623,120 @@ def _transcribe_deepgram(
         full_transcript = getattr(alternative, "transcript", None) or ""
 
         if diarize:
-            # Format as [Speaker X]: Text... while PRESERVING punctuation
-            # Also detect pauses (>1.5s gaps) to insert paragraph breaks
-            words = getattr(alternative, "words", None)
-
-            if not words or len(words) == 0:
-                # Fallback to plain transcript if word-level data is absent
-                return {"text": full_transcript, "detected_language": detected_language}
-
-            # Pause threshold in seconds - gaps longer than this trigger paragraph breaks
-            PAUSE_THRESHOLD = 1.5
-
-            # Strategy: Use word timestamps to find speaker change points AND pauses,
-            # then extract text segments from the formatted transcript.
-            # This preserves Deepgram's smart_format punctuation.
-            transcript_parts = []
-            current_speaker = None
-            segment_words: list[str] = []
-            last_word_end: float | None = None
-
-            for word in words:
-                speaker = getattr(word, "speaker", None)
-                word_start = getattr(word, "start", None)
-                word_end = getattr(word, "end", None)
-                # Use punctuated_word if available (has punctuation), else fall back to word
-                word_text = getattr(word, "punctuated_word", None) or getattr(word, "word", "")
-
-                # Detect pause: gap between last word end and this word start
-                is_pause = False
-                if last_word_end is not None and word_start is not None:
-                    gap = word_start - last_word_end
-                    if gap >= PAUSE_THRESHOLD:
-                        is_pause = True
-
-                # Start new segment on speaker change OR significant pause
-                if speaker != current_speaker or (is_pause and segment_words):
-                    # Flush previous segment
-                    if current_speaker is not None and segment_words:
-                        segment_text = " ".join(segment_words)
-                        # Format: **Speaker X:**\nText on next line
-                        transcript_parts.append(f"**Speaker {current_speaker}:**\n{segment_text}")
-
-                    # Only reset speaker if it actually changed
-                    if speaker != current_speaker:
-                        current_speaker = speaker
-                    segment_words = []
-
-                if word_text:
-                    segment_words.append(word_text)
-
-                # Track end time for pause detection
-                if word_end is not None:
-                    last_word_end = word_end
-
-            # Flush the last speaker segment
-            if current_speaker is not None and segment_words:
-                segment_text = " ".join(segment_words)
-                transcript_parts.append(f"**Speaker {current_speaker}:**\n{segment_text}")
-
-            return {
-                "text": "\n\n".join(transcript_parts),
-                "detected_language": detected_language,
-            }
+            # Prefer Deepgram's structured `paragraphs` output: it already
+            # carries speaker IDs, smart-format punctuation, and
+            # natural-pause paragraph boundaries, so we don't have to rebuild
+            # any of that from raw word timestamps.
+            text = _format_diarized_from_paragraphs(alternative)
+            if text is None:
+                # Fall back to walking words[] for older models or responses
+                # that don't include a paragraphs object.
+                text = _format_diarized_from_words(alternative)
+            if not text:
+                # Ultimate fallback: the unformatted full transcript.
+                text = full_transcript
+            return {"text": text, "detected_language": detected_language}
         else:
             return {"text": full_transcript, "detected_language": detected_language}
 
     except Exception as exc:
         raise RuntimeError(f"Deepgram error: {exc}") from exc
+
+
+def _format_diarized_from_paragraphs(alternative) -> str | None:
+    """Build a ``**Speaker N:**\\n<text>`` transcript from Deepgram's
+    ``paragraphs`` structure.
+
+    Returns None when the paragraphs object is missing or empty so the
+    caller can fall back to the word-loop. Each paragraph in Deepgram's
+    response carries a speaker, a start/end, and a list of sentences
+    whose ``.text`` is already punctuated by smart_format — so we just
+    join sentences within a paragraph and emit one speaker block per
+    paragraph (matching the prior word-loop behaviour where pauses
+    produced new blocks).
+    """
+    paragraphs_obj = getattr(alternative, "paragraphs", None)
+    if not paragraphs_obj:
+        return None
+    paragraphs_list = getattr(paragraphs_obj, "paragraphs", None)
+    if not paragraphs_list:
+        return None
+
+    parts: list[str] = []
+    for para in paragraphs_list:
+        speaker = getattr(para, "speaker", None)
+        if speaker is None:
+            continue
+        sentences = getattr(para, "sentences", None) or []
+        text = " ".join(
+            (getattr(s, "text", "") or "").strip()
+            for s in sentences
+            if getattr(s, "text", "")
+        ).strip()
+        if not text:
+            continue
+        parts.append(f"**Speaker {speaker}:**\n{text}")
+
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _format_diarized_from_words(alternative) -> str:
+    """Word-loop fallback used when ``alternative.paragraphs`` is absent.
+
+    Walks the per-word output, starting a new ``**Speaker N:**`` block on
+    every speaker change or pause longer than 1.5 seconds. Returns an
+    empty string when no words are present.
+    """
+    words = getattr(alternative, "words", None)
+    if not words or len(words) == 0:
+        return ""
+
+    # Pause threshold in seconds - gaps longer than this trigger paragraph breaks
+    PAUSE_THRESHOLD = 1.5
+
+    transcript_parts: list[str] = []
+    current_speaker = None
+    segment_words: list[str] = []
+    last_word_end: float | None = None
+
+    for word in words:
+        speaker = getattr(word, "speaker", None)
+        word_start = getattr(word, "start", None)
+        word_end = getattr(word, "end", None)
+        # Use punctuated_word if available (has punctuation), else fall back to word
+        word_text = getattr(word, "punctuated_word", None) or getattr(word, "word", "")
+
+        # Detect pause: gap between last word end and this word start
+        is_pause = False
+        if last_word_end is not None and word_start is not None:
+            gap = word_start - last_word_end
+            if gap >= PAUSE_THRESHOLD:
+                is_pause = True
+
+        # Start new segment on speaker change OR significant pause
+        if speaker != current_speaker or (is_pause and segment_words):
+            # Flush previous segment
+            if current_speaker is not None and segment_words:
+                segment_text = " ".join(segment_words)
+                transcript_parts.append(f"**Speaker {current_speaker}:**\n{segment_text}")
+
+            # Only reset speaker if it actually changed
+            if speaker != current_speaker:
+                current_speaker = speaker
+            segment_words = []
+
+        if word_text:
+            segment_words.append(word_text)
+
+        # Track end time for pause detection
+        if word_end is not None:
+            last_word_end = word_end
+
+    # Flush the last speaker segment
+    if current_speaker is not None and segment_words:
+        segment_text = " ".join(segment_words)
+        transcript_parts.append(f"**Speaker {current_speaker}:**\n{segment_text}")
+
+    return "\n\n".join(transcript_parts)

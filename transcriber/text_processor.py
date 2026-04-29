@@ -1,5 +1,6 @@
 """Text processing utilities for improving transcript readability."""
 
+import html
 import re
 from typing import Optional
 
@@ -158,6 +159,41 @@ def rename_speakers(text: str, name_map: dict[str, str]) -> str:
             new_label = f"**{new_name}:**"
             result = result.replace(old_pattern, new_label)
     return result
+
+
+def render_transcript_html(text: str, search_query: Optional[str] = None) -> str:
+    """
+    Convert a transcript (containing markdown-style **bold** and _italic_
+    markers, plus optional `**Speaker N:**` labels) to safe HTML for preview.
+
+    The raw transcript is HTML-escaped first so any markup in the underlying
+    text (e.g. a poisoned API response containing <script>) is rendered as
+    literal text. Search highlighting and markdown→HTML conversion run on
+    the escaped text and inject only their own known-safe tags.
+
+    Args:
+        text: Transcript text (may contain ** and _ markers).
+        search_query: Optional search query to highlight via <mark> tags.
+
+    Returns:
+        HTML-safe string ready for embedding in `unsafe_allow_html` markdown.
+    """
+    escaped = html.escape(text)
+
+    if search_query and search_query.strip():
+        escaped = search_and_highlight(escaped, search_query)
+
+    # Bold: **text** → <strong>text</strong> (non-greedy, paired markers).
+    escaped = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', escaped)
+    # Italic: _text_ → <em>text</em>. Paired underscores only, no newline
+    # crossing. Replaces the previous global `_`→`<em>` substitution which
+    # broke any text containing an odd number of underscores (e.g. filenames).
+    escaped = re.sub(
+        r'_([^_\n]+?)_',
+        r'<em style="color: #9ca3af;">\1</em>',
+        escaped,
+    )
+    return escaped
 
 
 def search_and_highlight(text: str, query: str) -> str:

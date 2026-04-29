@@ -44,7 +44,11 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 |---|---|---|
 | Python | 3.11+ | [python.org](https://python.org) |
 | uv | latest | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| ffmpeg | any | `brew install ffmpeg` |
+| **ffmpeg + ffprobe** | any recent | `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Debian/Ubuntu) |
+
+> **ffmpeg is required, not optional.** The app uses ffmpeg for all audio
+> transcoding, chunking, and metadata reading. If it isn't on `PATH`, the
+> app exits at startup with a clear install hint.
 
 ---
 
@@ -218,5 +222,6 @@ All tests are offline — no API keys required.
 | Transcript is in English even though audio is German | Make sure **Auto-detect** is selected and you are using Deepgram, not OpenAI/Groq |
 | PDF shows `?` for ü/ä/ö/œ | Arial Unicode must be installed — on macOS it lives in `/System/Library/Fonts/Supplemental/` |
 | Transcription fails immediately | Check your API key — invalid keys are rejected without retrying |
-| Large file runs out of memory | The app streams files >200 MB through ffmpeg; ensure ffmpeg is installed |
+| Large file runs out of memory | The app streams files through ffmpeg without loading them into RAM; ensure ffmpeg is installed and on `PATH` |
+| Startup error: "ffmpeg and ffprobe are required" | Install ffmpeg: `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Debian/Ubuntu) |
 | Duplicate words at chunk boundaries | Handled automatically by the deduplication step |

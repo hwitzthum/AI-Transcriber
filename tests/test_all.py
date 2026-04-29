@@ -63,8 +63,95 @@ def test_audio_validation():
     ok, msg = audio_processor.validate_file("tests/test_script.py")
     print(f"  ✅ Bad format: ok={ok}, msg={msg}")
     assert not ok, "Should fail for .py file"
-    
+
+    # Path traversal: deny-listed sensitive locations even if file exists.
+    # /etc/hosts is readable on macOS/Linux and would otherwise pass the
+    # exists/is_file/extension checks (but it doesn't have a supported suffix
+    # — so we test with a contrived path under /etc that has the right suffix).
+    if os.path.exists("/etc/hosts"):
+        # Symlink an .mp3-suffixed name into /etc to verify deny-list catches it
+        link_path = "/tmp/_traversal_test.mp3"
+        try:
+            if os.path.lexists(link_path):
+                os.unlink(link_path)
+            os.symlink("/etc/hosts", link_path)
+            ok, msg = audio_processor.validate_file(link_path)
+            print(f"  ✅ Traversal blocked: ok={ok}, msg={msg}")
+            assert not ok, "Should reject path resolving into /etc"
+            assert "protected" in msg.lower(), f"Expected 'protected' in msg, got: {msg}"
+        finally:
+            if os.path.lexists(link_path):
+                os.unlink(link_path)
+
     print("\n  ✅ All validation tests PASSED")
+
+
+def test_compute_upload_hash_deterministic():
+    """Same content must produce the same hash; different content differs."""
+    import io
+    separator("Upload Hash Determinism")
+
+    a = io.BytesIO(b"some audio content here for hashing" * 100)
+    b = io.BytesIO(b"some audio content here for hashing" * 100)
+    different = io.BytesIO(b"different audio content" * 100)
+
+    hash_a = audio_processor.compute_upload_hash(a)
+    hash_b = audio_processor.compute_upload_hash(b)
+    hash_diff = audio_processor.compute_upload_hash(different)
+
+    print(f"  hash(a) = {hash_a}")
+    print(f"  hash(b) = {hash_b}")
+    print(f"  hash(different) = {hash_diff}")
+    assert hash_a == hash_b, "Identical content must produce identical hashes"
+    assert hash_a != hash_diff, "Different content must produce different hashes"
+    print("  ✅ Hash is deterministic and content-sensitive")
+
+
+def test_compute_upload_hash_uses_size():
+    """Two buffers with identical head/tail but different sizes must hash differently."""
+    import io
+    # Construct head and tail blocks (each 100 KB) shared between both buffers.
+    head = b"H" * 100_000
+    tail = b"T" * 100_000
+    # Buffer 1: just head + tail (200 KB total)
+    buf1 = io.BytesIO(head + tail)
+    # Buffer 2: head + 1 MB filler + tail (still has the same first 64KB and last 64KB)
+    buf2 = io.BytesIO(head + b"\x00" * 1_000_000 + tail)
+
+    h1 = audio_processor.compute_upload_hash(buf1)
+    h2 = audio_processor.compute_upload_hash(buf2)
+    assert h1 != h2, "Hash must include file size to disambiguate same head/tail"
+    print(f"  ✅ Size is part of the hash — different lengths produce different hashes")
+
+
+def test_chunking_threshold_per_provider():
+    """A file under the OpenAI 24 MB limit reports needs_chunking=False;
+    the same file with a tiny 1 KB limit reports True. Demonstrates the
+    per-provider knob without needing a 25 MB fixture."""
+    separator("Chunking Threshold (Per-Provider)")
+
+    test_file = "tests/test_english.mp3"
+    size = os.path.getsize(test_file)
+    print(f"  Test file size: {size} bytes ({size / 1024:.1f} KB)")
+
+    # With the default OpenAI/Groq limit, the small test fixture fits in one chunk
+    assert not audio_processor.needs_chunking(test_file), (
+        "Small test file should NOT need chunking at default OpenAI limit"
+    )
+    print(f"  ✅ Default OpenAI limit: small file does not need chunking")
+
+    # With an artificially tiny limit, the same file should need chunking
+    assert audio_processor.needs_chunking(test_file, max_bytes=1024), (
+        "Test file should need chunking when limit is 1 KB"
+    )
+    print(f"  ✅ Tiny 1 KB limit: file needs chunking")
+
+    # And chunk_audio must respect the parameterised limit: a tiny limit
+    # produces multiple chunk paths, the default limit produces one.
+    single = audio_processor.chunk_audio(test_file)
+    assert len(single) == 1, f"Expected 1 chunk at default limit, got {len(single)}"
+    audio_processor.cleanup_chunks(single, test_file)
+    print(f"  ✅ Single-chunk path returns 1 file at default limit")
 
 
 def test_audio_info():
@@ -84,79 +171,68 @@ def test_audio_info():
 
 
 def test_chunking_logic():
-    """Test 3: Chunking — verify the small file doesn't get split, 
-    and test chunking with a forced lower threshold."""
+    """Test 3: Chunking — verify the small file doesn't get split,
+    and test chunking with a forced lower threshold via the max_bytes kwarg."""
     separator("Chunking Logic")
-    
-    # Small file should NOT need chunking
+
+    # Small file should NOT need chunking at the default OpenAI/Groq limit
     needs = audio_processor.needs_chunking("tests/test_english.mp3")
     print(f"  Small file needs chunking: {needs}")
     assert not needs, "Small file should not need chunking"
     print(f"  ✅ Small file correctly skips chunking")
-    
-    # Test chunking with artificially low threshold
-    original_max = audio_processor.MAX_CHUNK_BYTES
-    try:
-        # Force chunking by setting threshold very low (5 KB)
-        audio_processor.MAX_CHUNK_BYTES = 5 * 1024
-        
-        needs = audio_processor.needs_chunking("tests/test_english.mp3")
-        print(f"  With 5KB threshold, needs chunking: {needs}")
-        assert needs, "Should need chunking with 5KB threshold"
-        
-        chunks = audio_processor.chunk_audio("tests/test_english.mp3")
-        print(f"  Chunk count: {len(chunks)}")
-        print(f"  Chunk files:")
-        for i, c in enumerate(chunks):
-            size = os.path.getsize(c) / 1024
-            print(f"    [{i}] {os.path.basename(c)} — {size:.1f} KB")
-        
-        assert len(chunks) > 1, "Should produce multiple chunks"
-        
-        # Verify all chunk files exist
-        for c in chunks:
-            assert os.path.exists(c), f"Chunk file missing: {c}"
-        
-        # Test cleanup
-        audio_processor.cleanup_chunks(chunks, "tests/test_english.mp3")
-        for c in chunks:
-            assert not os.path.exists(c), f"Chunk not cleaned up: {c}"
-        print(f"  ✅ Cleanup removed all {len(chunks)} temp chunks")
-        
-    finally:
-        audio_processor.MAX_CHUNK_BYTES = original_max
-    
+
+    # Force chunking by passing a tiny max_bytes — exercises the multi-chunk path.
+    forced_limit = 5 * 1024  # 5 KB
+    needs = audio_processor.needs_chunking("tests/test_english.mp3", max_bytes=forced_limit)
+    print(f"  With 5KB threshold, needs chunking: {needs}")
+    assert needs, "Should need chunking with 5KB threshold"
+
+    chunks = audio_processor.chunk_audio("tests/test_english.mp3", max_bytes=forced_limit)
+    print(f"  Chunk count: {len(chunks)}")
+    print(f"  Chunk files:")
+    for i, c in enumerate(chunks):
+        size = os.path.getsize(c) / 1024
+        print(f"    [{i}] {os.path.basename(c)} — {size:.1f} KB")
+
+    assert len(chunks) > 1, "Should produce multiple chunks"
+
+    # Verify all chunk files exist
+    for c in chunks:
+        assert os.path.exists(c), f"Chunk file missing: {c}"
+
+    # Test cleanup
+    audio_processor.cleanup_chunks(chunks, "tests/test_english.mp3")
+    for c in chunks:
+        assert not os.path.exists(c), f"Chunk not cleaned up: {c}"
+    print(f"  ✅ Cleanup removed all {len(chunks)} temp chunks")
+
     print("\n  ✅ Chunking logic PASSED")
 
 
-def test_video_optimization():
-    separator("Video Optimization (Large File Handling)")
-    
+def test_video_audio_extraction():
+    """Verify video files are transcoded to MP3 audio via ffmpeg (the
+    `_ensure_mp3` helper drops video with `-vn` and produces a speech-
+    optimised MP3)."""
+    separator("Video → MP3 Extraction")
+
     video_path = "tests/test_video.mp4"
     if not os.path.exists(video_path):
-        # reuse generation logic or skip
-        print("  ⚠️ Test video not found, skipping optimization test")
+        print("  ⚠️ Test video not found, skipping")
         return
 
-    # Check if optimization path works by mocking size check or lowering threshold?
-    # We can't easily change the hardcoded 50MB inside the function without monkeypatching.
-    # But we can verify _extract_audio_from_video works directly.
-    
-    print("  ⏳ Testing direct audio extraction...")
-    extracted_path = audio_processor._extract_audio_from_video(video_path)
+    extracted_path = audio_processor._ensure_mp3(video_path)
     print(f"  Extracted to: {extracted_path}")
-    
+
     assert os.path.exists(extracted_path), "Extracted file should exist"
     assert os.path.getsize(extracted_path) > 0, "Extracted file should not be empty"
     assert extracted_path.endswith(".mp3"), "Extracted file should be MP3"
-    
-    # Check info of extracted file
+    # Sanity-check it's an actual audio file ffprobe can read.
     info = audio_processor.get_audio_info(extracted_path)
-    print(f"  Extracted Duration: {info['duration_formatted']}")
-    
-    # Cleanup
+    print(f"  Duration: {info['duration_formatted']}")
+    assert info["duration_seconds"] > 0, "Extracted MP3 should have a duration"
+
     os.unlink(extracted_path)
-    print("  ✅ Direct extraction PASSED")
+    print("  ✅ Video → MP3 extraction works")
 
 
 def test_docx_export(text):
@@ -245,7 +321,7 @@ if __name__ == "__main__":
         ("Audio Metadata", test_audio_info),
         ("Chunking Logic", test_chunking_logic),
         ("Format Conversion", test_format_conversion),
-        ("Video Optimization", test_video_optimization),
+        ("Video Optimization", test_video_audio_extraction),
     ]
     
     # Note: Cloud API integration tests require real API keys.

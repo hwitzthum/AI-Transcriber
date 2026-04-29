@@ -8,7 +8,6 @@ mlx-whisper model (optimized for Apple Silicon) or cloud APIs
 Run with: uv run streamlit run app.py
 """
 
-import hashlib
 import os
 import tempfile
 import logging
@@ -20,22 +19,23 @@ from transcriber import exporter
 from transcriber import text_processor
 
 
-def _compute_file_hash(file_buffer) -> str:
-    """Compute a fast hash of the file buffer to detect changes.
+@st.cache_data(show_spinner=False)
+def _cached_audio_info(file_path: str, mtime: float) -> dict:
+    """Streamlit-cached wrapper around audio_processor.get_audio_info.
 
-    Uses first 64KB + last 64KB + file size for speed on large files.
+    The ``mtime`` argument participates in the cache key so the cache is
+    invalidated when the on-disk file changes; it is otherwise unused.
+    Without this, ffprobe spawns a subprocess on every Streamlit rerun
+    (every checkbox click, search keystroke, etc.) — measurable lag on
+    long editing sessions.
     """
-    hasher = hashlib.md5()
-    data = file_buffer.getvalue()
+    return audio_processor.get_audio_info(file_path)
 
-    # Hash first 64KB
-    hasher.update(data[:65536])
-    # Hash last 64KB
-    hasher.update(data[-65536:])
-    # Include file size to differentiate files with same head/tail
-    hasher.update(str(len(data)).encode())
 
-    return hasher.hexdigest()
+@st.cache_data(show_spinner=False)
+def _cached_needs_chunking(file_path: str, mtime: float, max_bytes: int) -> bool:
+    """Streamlit-cached wrapper around audio_processor.needs_chunking."""
+    return audio_processor.needs_chunking(file_path, max_bytes=max_bytes)
 
 
 def _get_cached_upload_path(uploaded_file) -> str:
@@ -44,7 +44,7 @@ def _get_cached_upload_path(uploaded_file) -> str:
     Uses session state to cache the temp file path based on file content hash.
     This prevents writing duplicate temp files on every Streamlit re-run.
     """
-    file_hash = _compute_file_hash(uploaded_file)
+    file_hash = audio_processor.compute_upload_hash(uploaded_file)
     cache_key = f"_upload_cache_{file_hash}"
 
     # Check if we already have a cached path for this exact file
@@ -102,6 +102,17 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# Startup gate: ffmpeg/ffprobe are hard prerequisites. If they aren't on
+# PATH, every audio operation in the app will fail later with an opaque
+# error — surface it immediately as a clean Streamlit error instead so
+# the user knows what to install.
+try:
+    audio_processor.require_ffmpeg()
+except RuntimeError as _ffmpeg_err:
+    st.error(f"❌ {_ffmpeg_err}")
+    st.stop()
 
 # ── Custom CSS — "Studio Noir" Design System ─────────────────────────────────
 
@@ -1045,20 +1056,29 @@ elif file_path_input.strip():
 
 if audio_file_path:
     try:
-        info = audio_processor.get_audio_info(audio_file_path)
+        # mtime participates in the cache key — file change → cache miss.
+        file_mtime = os.path.getmtime(audio_file_path)
+        info = _cached_audio_info(audio_file_path, file_mtime)
         st.session_state.audio_info = info
-        
+
         # Display audio info
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("⏱️ Duration", info["duration_formatted"])
         col2.metric("📦 Size", f"{info['file_size_mb']:.1f} MB")
         col3.metric("🔊 Channels", info["channels"])
         col4.metric("📊 Sample Rate", f"{info['sample_rate']} Hz")
-        
-        needs_split = audio_processor.needs_chunking(audio_file_path)
+
+        # Use the chosen provider's upload limit so the "needs chunking" hint
+        # only fires when this specific provider would actually need it.
+        provider_max_chunk_bytes = cloud_engine.get_max_chunk_bytes(cloud_provider)
+        needs_split = _cached_needs_chunking(
+            audio_file_path,
+            file_mtime,
+            provider_max_chunk_bytes,
+        )
         if needs_split:
             st.info("📎 This file is large and will be split into chunks for processing.")
-        
+
     except Exception as e:
         st.error(f"❌ Could not read audio file: {e}")
         audio_file_path = None
@@ -1084,10 +1104,17 @@ if audio_file_path:
                 progress_bar.progress(current / total)
             status_text.markdown(f"⏳ **{message}**")
         
+        # Initialised before the try so the finally block is safe even if
+        # chunk_audio() itself raises before returning a list.
+        chunk_paths: list[str] = []
         try:
-            # Step 1: Chunk the audio
+            # Step 1: Chunk the audio (using provider-specific upload ceiling).
             status_text.markdown("⏳ **Preparing audio...**")
-            chunk_paths = audio_processor.chunk_audio(audio_file_path, progress_callback=update_progress)
+            chunk_paths = audio_processor.chunk_audio(
+                audio_file_path,
+                progress_callback=update_progress,
+                max_bytes=cloud_engine.get_max_chunk_bytes(cloud_provider),
+            )
 
             # Step 2: Transcribe (Cloud Only)
 
@@ -1111,9 +1138,6 @@ if audio_file_path:
             # Store result
             st.session_state.transcript = transcript
             st.session_state.is_transcribing = False
-
-            # Cleanup temp chunks
-            audio_processor.cleanup_chunks(chunk_paths, audio_file_path)
 
             progress_bar.progress(1.0)
             status_text.markdown("✅ **Transcription complete!**")
@@ -1156,6 +1180,12 @@ if audio_file_path:
                 st.error(f"Transcription failed: {error_msg}")
 
             logger.exception("Transcription error")
+        finally:
+            # Always clean up chunk temp files — leaving them behind on
+            # transcription failure used to accumulate hundreds of MB across
+            # repeated retry attempts.
+            if chunk_paths:
+                audio_processor.cleanup_chunks(chunk_paths, audio_file_path)
 
 # Cleanup temp upload
 if temp_upload_path and os.path.exists(temp_upload_path):
@@ -1256,19 +1286,10 @@ if st.session_state.transcript:
     else:
         st.caption("Formatted preview. Switch to Edit mode to make changes.")
 
-        # Prepare display text with search highlighting
-        display_text = st.session_state.transcript
-
-        # Apply search highlighting if query provided
-        if search_query:
-            display_text = text_processor.search_and_highlight(display_text, search_query)
-
-        # Convert markdown bold to HTML bold, italic to HTML italic
-        display_html = display_text.replace("**", "<strong>").replace("_", "<em>")
-        # Fix paired tags (every other occurrence)
-        import re
-        display_html = re.sub(r'<strong>([^<]+)<strong>', r'<strong>\1</strong>', display_html)
-        display_html = re.sub(r'<em>([^<]+)<em>', r'<em style="color: #9ca3af;">\1</em>', display_html)
+        display_html = text_processor.render_transcript_html(
+            st.session_state.transcript,
+            search_query=search_query,
+        )
 
         # Render formatted preview
         st.markdown(
