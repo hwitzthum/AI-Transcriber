@@ -70,6 +70,19 @@ def test_retry_predicate():
         print(f"    {status} '{str(exc)[:40]}...' -> retry={result}")
         assert not result, f"Should NOT retry on: {exc}"
 
+    # --- Substring false-positives (must NOT retry just because "400"/"429"
+    # appears inside a larger token like "14002" or "stream id 4291"). ---
+    embedded_substring_cases = [
+        Exception("Server returned status 14002"),
+        Exception("error in stream id 4291 but otherwise fine"),
+    ]
+    print("\n  Testing substring false-positives (should NOT retry):")
+    for exc in embedded_substring_cases:
+        result = cloud_engine._is_retriable_error(exc)
+        status = "✅" if not result else "❌"
+        print(f"    {status} '{str(exc)[:40]}...' -> retry={result}")
+        assert not result, f"Should NOT retry on embedded-substring: {exc}"
+
     print("\n  ✅ Smart retry predicate PASSED")
 
 

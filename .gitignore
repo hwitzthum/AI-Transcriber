@@ -99,3 +99,6 @@ Thumbs.db
 # ── uv ───────────────────────────────────────────────────────────────────────
 # .venv is excluded above.
 # uv.lock IS committed — it ensures reproducible installs across machines.
+
+# ── Local test artifacts ─────────────────────────────────────────────────────
+.playwright-mcp/

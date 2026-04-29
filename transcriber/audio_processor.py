@@ -30,14 +30,61 @@ SUPPORTED_EXTENSIONS = {
     ".opus", ".webm", ".mp4", ".mov", ".avi", ".mkv",
 }
 
+# Sensitive filesystem locations the user-facing path input must never resolve
+# into. The check is post-realpath, so symlink traversal can't bypass it.
+# Why a deny-list rather than an allow-list: legitimate audio files live in
+# many places on a personal machine (~/Documents, /Volumes/<drive>, /tmp).
+# An allow-list would force users to configure roots; a deny-list blocks the
+# obvious exfiltration targets while keeping the local-use ergonomics.
+_DENIED_PATH_PREFIXES = (
+    "/etc",
+    "/private/etc",
+    "/root",
+    "/var/root",
+    "/sys",
+    "/proc",
+    "/private/var/db",
+    "/private/var/root",
+)
+_DENIED_PATH_SUBSTRINGS = (
+    "/.ssh/",
+    "/.aws/",
+    "/.gnupg/",
+    "/.config/gh/",
+    "/.docker/",
+    "/.kube/",
+)
+
 
 def validate_file(file_path: str) -> tuple[bool, str]:
-    """Validate that a file exists and is a supported audio format."""
+    """Validate that a file exists and is a supported audio format.
+
+    Resolves symlinks before checking, then rejects paths that point at
+    sensitive system locations or user secret directories. This is a
+    defense-in-depth measure for the "Or Enter Path" UI input — without it,
+    a user-supplied path would be passed straight to ffprobe/ffmpeg and any
+    file the process could read would be uploaded to the transcription API.
+    """
     path = Path(file_path)
     if not path.exists():
         return False, f"File not found: {file_path}"
     if not path.is_file():
         return False, f"Not a file: {file_path}"
+
+    # Canonicalize: follow symlinks and resolve "..", so a path like
+    # "/Users/x/audio/../../../etc/passwd" cannot sneak past the deny-list.
+    try:
+        resolved = str(path.resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        return False, f"Could not resolve path: {exc}"
+
+    for prefix in _DENIED_PATH_PREFIXES:
+        if resolved == prefix or resolved.startswith(prefix + "/"):
+            return False, "Access denied: path resolves to a protected location."
+    for needle in _DENIED_PATH_SUBSTRINGS:
+        if needle in resolved:
+            return False, "Access denied: path resolves to a protected location."
+
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
         return False, (
             f"Unsupported format: {path.suffix}. "

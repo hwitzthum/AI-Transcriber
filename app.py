@@ -1084,6 +1084,9 @@ if audio_file_path:
                 progress_bar.progress(current / total)
             status_text.markdown(f"⏳ **{message}**")
         
+        # Initialised before the try so the finally block is safe even if
+        # chunk_audio() itself raises before returning a list.
+        chunk_paths: list[str] = []
         try:
             # Step 1: Chunk the audio
             status_text.markdown("⏳ **Preparing audio...**")
@@ -1111,9 +1114,6 @@ if audio_file_path:
             # Store result
             st.session_state.transcript = transcript
             st.session_state.is_transcribing = False
-
-            # Cleanup temp chunks
-            audio_processor.cleanup_chunks(chunk_paths, audio_file_path)
 
             progress_bar.progress(1.0)
             status_text.markdown("✅ **Transcription complete!**")
@@ -1156,6 +1156,12 @@ if audio_file_path:
                 st.error(f"Transcription failed: {error_msg}")
 
             logger.exception("Transcription error")
+        finally:
+            # Always clean up chunk temp files — leaving them behind on
+            # transcription failure used to accumulate hundreds of MB across
+            # repeated retry attempts.
+            if chunk_paths:
+                audio_processor.cleanup_chunks(chunk_paths, audio_file_path)
 
 # Cleanup temp upload
 if temp_upload_path and os.path.exists(temp_upload_path):
@@ -1256,19 +1262,10 @@ if st.session_state.transcript:
     else:
         st.caption("Formatted preview. Switch to Edit mode to make changes.")
 
-        # Prepare display text with search highlighting
-        display_text = st.session_state.transcript
-
-        # Apply search highlighting if query provided
-        if search_query:
-            display_text = text_processor.search_and_highlight(display_text, search_query)
-
-        # Convert markdown bold to HTML bold, italic to HTML italic
-        display_html = display_text.replace("**", "<strong>").replace("_", "<em>")
-        # Fix paired tags (every other occurrence)
-        import re
-        display_html = re.sub(r'<strong>([^<]+)<strong>', r'<strong>\1</strong>', display_html)
-        display_html = re.sub(r'<em>([^<]+)<em>', r'<em style="color: #9ca3af;">\1</em>', display_html)
+        display_html = text_processor.render_transcript_html(
+            st.session_state.transcript,
+            search_query=search_query,
+        )
 
         # Render formatted preview
         st.markdown(

@@ -63,7 +63,26 @@ def test_audio_validation():
     ok, msg = audio_processor.validate_file("tests/test_script.py")
     print(f"  ✅ Bad format: ok={ok}, msg={msg}")
     assert not ok, "Should fail for .py file"
-    
+
+    # Path traversal: deny-listed sensitive locations even if file exists.
+    # /etc/hosts is readable on macOS/Linux and would otherwise pass the
+    # exists/is_file/extension checks (but it doesn't have a supported suffix
+    # — so we test with a contrived path under /etc that has the right suffix).
+    if os.path.exists("/etc/hosts"):
+        # Symlink an .mp3-suffixed name into /etc to verify deny-list catches it
+        link_path = "/tmp/_traversal_test.mp3"
+        try:
+            if os.path.lexists(link_path):
+                os.unlink(link_path)
+            os.symlink("/etc/hosts", link_path)
+            ok, msg = audio_processor.validate_file(link_path)
+            print(f"  ✅ Traversal blocked: ok={ok}, msg={msg}")
+            assert not ok, "Should reject path resolving into /etc"
+            assert "protected" in msg.lower(), f"Expected 'protected' in msg, got: {msg}"
+        finally:
+            if os.path.lexists(link_path):
+                os.unlink(link_path)
+
     print("\n  ✅ All validation tests PASSED")
 
 

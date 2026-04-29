@@ -47,11 +47,21 @@ def _is_retriable_error(exc: BaseException) -> bool:
     - 403 Forbidden (access denied)
     - 404 Not Found
     """
-    exc_str = str(exc).lower()
+    exc_str_raw = str(exc)
+    exc_str = exc_str_raw.lower()
 
-    # Check for explicit retriable status codes in the error message
+    # Non-retriable status codes are checked FIRST, with word boundaries, so
+    # that an embedded substring like "400" inside a larger number (e.g.
+    # "14002") never falsely classifies as retriable. Use \b to anchor on
+    # whole numeric tokens.
+    _NON_RETRIABLE_CODES = (400, 401, 403, 404)
+    for code in _NON_RETRIABLE_CODES:
+        if re.search(rf"\b{code}\b", exc_str_raw):
+            return False
+
+    # Retriable status codes — also word-boundary anchored to avoid embedded matches.
     for code in _RETRIABLE_STATUS_CODES:
-        if str(code) in str(exc):
+        if re.search(rf"\b{code}\b", exc_str_raw):
             return True
 
     # Check for common retriable error patterns
@@ -76,21 +86,17 @@ def _is_retriable_error(exc: BaseException) -> bool:
     if any(pattern in exc_str for pattern in retriable_patterns):
         return True
 
-    # Check for non-retriable patterns - if found, don't retry
+    # Check for non-retriable text patterns (the numeric codes are already handled above).
     non_retriable_patterns = [
-        "401",
         "unauthorized",
         "invalid api key",
         "authentication",
-        "400",
         "bad request",
         "invalid audio",
         "unsupported format",
         "file too large",
-        "403",
         "forbidden",
         "access denied",
-        "404",
         "not found",
     ]
 
