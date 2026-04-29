@@ -238,6 +238,8 @@ with st.sidebar:
 
     # Diarization Option (Deepgram only)
     enable_diarization = False
+    highlight_low_confidence = False
+    low_confidence_threshold_value = 0.6
     if "Deepgram" in cloud_provider:
         st.markdown("")  # spacing
         enable_diarization = st.checkbox(
@@ -251,6 +253,33 @@ with st.sidebar:
                 'Nova-3 handles mixed-language audio automatically'
                 '</p>',
                 unsafe_allow_html=True,
+            )
+
+        # Confidence highlighting is Deepgram-only because OpenAI/Groq
+        # verbose_json doesn't expose per-word confidence — segment-level
+        # avg_logprob exists but doesn't tell you *which* word is shaky.
+        highlight_low_confidence = st.checkbox(
+            "Highlight low-confidence words",
+            value=False,
+            help=(
+                "Wrap words below the confidence threshold in an amber "
+                "highlight (visible in the editor preview and DOCX export). "
+                "Use it as a guide for manual review — the highlighted words "
+                "are the ones the model was least sure of."
+            ),
+        )
+        if highlight_low_confidence:
+            low_confidence_threshold_value = st.slider(
+                "Confidence threshold",
+                min_value=0.3,
+                max_value=0.95,
+                value=0.6,
+                step=0.05,
+                help=(
+                    "Words at or below this score get highlighted. "
+                    "0.6 is a reasonable default; raise it to flag more "
+                    "(noisier) words, lower it to flag only the worst."
+                ),
             )
 
     # Timestamps option — independent of provider, since both Deepgram
@@ -593,6 +622,16 @@ if audio_file_path:
             # Pass diarize flag only if supported (Deepgram)
             diarize_flag = enable_diarization if "Deepgram" in cloud_provider else False
 
+            # Threshold only applies when the user opted in *and* the
+            # provider supports per-word confidence (Deepgram). Passing
+            # None to other providers means the parameter is simply
+            # ignored downstream.
+            threshold = (
+                low_confidence_threshold_value
+                if (highlight_low_confidence and "Deepgram" in cloud_provider)
+                else None
+            )
+
             result = cloud_engine.transcribe_chunks_streaming(
                 chunk_iter=_collecting_iter(),
                 total=total_chunks,
@@ -603,6 +642,7 @@ if audio_file_path:
                 diarize=diarize_flag,
                 include_timestamps=include_timestamps,
                 chunk_offsets=chunk_offsets,
+                low_confidence_threshold=threshold,
             )
 
             transcript = result["text"]

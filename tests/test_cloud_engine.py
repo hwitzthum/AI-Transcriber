@@ -437,7 +437,7 @@ def test_parallel_transcribe_chunks_preserves_order(monkeypatch):
     }
     sleeps = {"chunk_a.mp3": 0.10, "chunk_b.mp3": 0.05, "chunk_c.mp3": 0.01}
 
-    def fake_transcribe_single(file_path, provider, config, client, language, diarize):
+    def fake_transcribe_single(file_path, provider, config, client, language, diarize, low_confidence_threshold=None):
         _time.sleep(sleeps[file_path])
         return fake_results[file_path]
 
@@ -490,7 +490,7 @@ def test_streaming_overlaps_chunking_and_transcription(monkeypatch):
             _time.sleep(encode_secs)
             yield f"chunk_{i}.mp3"
 
-    def fake_transcribe_single(file_path, provider, config, client, language, diarize):
+    def fake_transcribe_single(file_path, provider, config, client, language, diarize, low_confidence_threshold=None):
         _time.sleep(upload_secs)
         return {"text": f"text-from-{file_path}", "detected_language": "en"}
 
@@ -531,7 +531,7 @@ def test_parallel_transcribe_chunks_graceful_degradation(monkeypatch):
     surviving chunks are merged and the failure index is reported."""
     separator("Parallel transcribe_chunks graceful degradation")
 
-    def fake_transcribe_single(file_path, provider, config, client, language, diarize):
+    def fake_transcribe_single(file_path, provider, config, client, language, diarize, low_confidence_threshold=None):
         if file_path == "boom.mp3":
             raise RuntimeError("simulated transient failure")
         return {"text": f"text from {file_path}", "detected_language": None}

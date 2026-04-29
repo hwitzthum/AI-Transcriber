@@ -242,6 +242,7 @@ def transcribe_chunks(
     max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
     include_timestamps: bool = False,
     chunk_offsets: list[float] | None = None,
+    low_confidence_threshold: float | None = None,
 ) -> dict:
     """
     Transcribe a fully-prepared list of audio chunks using a cloud API.
@@ -265,6 +266,7 @@ def transcribe_chunks(
         max_workers=max_workers,
         include_timestamps=include_timestamps,
         chunk_offsets=chunk_offsets,
+        low_confidence_threshold=low_confidence_threshold,
     )
 
 
@@ -280,6 +282,7 @@ def transcribe_chunks_streaming(
     max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
     include_timestamps: bool = False,
     chunk_offsets: list[float] | None = None,
+    low_confidence_threshold: float | None = None,
 ) -> dict:
     """
     Transcribe audio chunks as they arrive from ``chunk_iter``.
@@ -330,6 +333,14 @@ def transcribe_chunks_streaming(
             respective chunk) can be translated into absolute file
             time. Compute via :func:`audio_processor.compute_chunk_offsets`.
             Ignored when ``include_timestamps`` is False.
+        low_confidence_threshold: When set (e.g. ``0.6``), Deepgram's
+            per-word confidence scores are consulted; words at or
+            below the threshold are wrapped with ``~~word~~`` markers
+            so the preview UI can highlight them in amber. Other
+            providers don't expose per-word confidence, so the
+            parameter is silently ignored for them. ``None`` (the
+            default) skips the check entirely and preserves the
+            existing smart-formatted output verbatim.
 
     Returns:
         dict with keys:
@@ -454,6 +465,7 @@ def transcribe_chunks_streaming(
                 client,
                 language,
                 diarize,
+                low_confidence_threshold,
             )
             pending[future] = i
             # Opportunistically retire any futures that finished while
@@ -774,14 +786,21 @@ def _transcribe_single(
     client,
     language: str | None,
     diarize: bool = False,
+    low_confidence_threshold: float | None = None,
 ) -> dict:
     """
     Transcribe a single audio file using the specified cloud provider.
+
+    ``low_confidence_threshold`` is forwarded only to Deepgram; the
+    Whisper-family providers don't expose per-word confidence in
+    verbose_json, so wrapping wouldn't be possible there even if we
+    plumbed it through.
 
     Returns:
         dict with keys:
             "text": str
             "detected_language": str | None
+            "paragraphs": list[dict]
     """
     if "OpenAI" in provider:
         return _transcribe_openai(file_path, config["model"], client, language)
@@ -789,7 +808,15 @@ def _transcribe_single(
         return _transcribe_groq(file_path, config["model"], client, language)
     elif "Deepgram" in provider:
         is_multilingual = config.get("multilingual", False)
-        return _transcribe_deepgram(file_path, config["model"], client, language, diarize, is_multilingual)
+        return _transcribe_deepgram(
+            file_path,
+            config["model"],
+            client,
+            language,
+            diarize,
+            is_multilingual,
+            low_confidence_threshold=low_confidence_threshold,
+        )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -884,6 +911,7 @@ def _transcribe_deepgram(
     language: str | None,
     diarize: bool = False,
     is_multilingual: bool = False,
+    low_confidence_threshold: float | None = None,
 ) -> dict:
     """Transcribe using Deepgram API with smart retry and diarization support.
 
@@ -966,18 +994,25 @@ def _transcribe_deepgram(
     # Get the fully formatted transcript (with punctuation, smart formatting)
     full_transcript = getattr(alternative, "transcript", None) or ""
 
-    paragraphs_data = _extract_deepgram_paragraphs(alternative, diarize)
+    paragraphs_data = _extract_deepgram_paragraphs(
+        alternative, diarize, low_confidence_threshold
+    )
 
     if diarize:
-        # Prefer Deepgram's structured `paragraphs` output: it already
-        # carries speaker IDs, smart-format punctuation, and
-        # natural-pause paragraph boundaries, so we don't have to rebuild
-        # any of that from raw word timestamps.
-        text = _format_diarized_from_paragraphs(alternative)
-        if text is None:
-            # Fall back to walking words[] for older models or responses
-            # that don't include a paragraphs object.
-            text = _format_diarized_from_words(alternative)
+        if low_confidence_threshold is not None:
+            # The paragraph-sentence shortcut renders smart-formatted
+            # text that has no per-word link, so it can't carry the
+            # ~~…~~ markers. Walk the word list instead.
+            text = _format_diarized_from_words(alternative, low_confidence_threshold)
+        else:
+            # Prefer Deepgram's structured `paragraphs` output: it
+            # carries smart-format punctuation and natural-pause
+            # paragraph boundaries, so we don't have to rebuild any of
+            # that from raw word timestamps.
+            text = _format_diarized_from_paragraphs(alternative)
+            if text is None:
+                # Older models / responses without a paragraphs object.
+                text = _format_diarized_from_words(alternative)
         if not text:
             # Ultimate fallback: the unformatted full transcript.
             text = full_transcript
@@ -987,14 +1022,70 @@ def _transcribe_deepgram(
             "paragraphs": paragraphs_data,
         }
     else:
+        if low_confidence_threshold is not None:
+            text = _format_undiarized_from_words(alternative, low_confidence_threshold)
+            if not text:
+                text = full_transcript
+        else:
+            text = full_transcript
         return {
-            "text": full_transcript,
+            "text": text,
             "detected_language": detected_language,
             "paragraphs": paragraphs_data,
         }
 
 
-def _extract_deepgram_paragraphs(alternative, diarize: bool) -> list[dict]:
+def _format_undiarized_from_words(
+    alternative,
+    low_confidence_threshold: float | None,
+) -> str:
+    """Walk the per-word output without speaker tracking.
+
+    Used when low-confidence wrapping is requested but diarization is
+    off — the smart-formatted ``alternative.transcript`` has no
+    per-word link to confidence scores, so we can't wrap from there.
+    Paragraph breaks fire on pauses ≥1.5 s, matching the diarized
+    word-loop path so the visual rhythm stays consistent.
+    """
+    words = getattr(alternative, "words", None)
+    if not words:
+        return ""
+
+    PAUSE = 1.5
+    parts: list[str] = []
+    current: list[str] = []
+    last_end: float | None = None
+
+    for word in words:
+        word_start = getattr(word, "start", None)
+        word_end = getattr(word, "end", None)
+        word_text = _render_word_token(word, low_confidence_threshold)
+
+        if (
+            current
+            and last_end is not None
+            and word_start is not None
+            and (word_start - last_end) >= PAUSE
+        ):
+            parts.append(" ".join(current).strip())
+            current = []
+
+        if word_text:
+            current.append(word_text)
+        if word_end is not None:
+            last_end = word_end
+
+    if current:
+        parts.append(" ".join(current).strip())
+
+    return "\n\n".join(parts)
+
+
+def _extract_deepgram_paragraphs(
+    alternative,
+    diarize: bool,
+    low_confidence_threshold: float | None = None,
+) -> list[dict]:
     """Return a list of ``{text, start_sec, end_sec, speaker}`` dicts from
     Deepgram's response, used by the timestamped-output path.
 
@@ -1004,7 +1095,17 @@ def _extract_deepgram_paragraphs(alternative, diarize: bool) -> list[dict]:
     chunk-overlap regions by time and prepend ``[HH:MM:SS]`` markers.
     Returns an empty list when no usable timing data is available; the
     caller treats that as "no timestamps for this chunk."
+
+    When ``low_confidence_threshold`` is set we always go through the
+    word-loop fallback so each individual word's confidence is visible
+    — the paragraph-sentence shortcut path doesn't carry per-word data,
+    so it can't honour the wrapping request.
     """
+    if low_confidence_threshold is not None:
+        return _extract_deepgram_paragraphs_from_words(
+            alternative, diarize, low_confidence_threshold
+        )
+
     paragraphs_obj = getattr(alternative, "paragraphs", None)
     paragraphs_list = (
         getattr(paragraphs_obj, "paragraphs", None) if paragraphs_obj else None
@@ -1034,7 +1135,11 @@ def _extract_deepgram_paragraphs(alternative, diarize: bool) -> list[dict]:
     return _extract_deepgram_paragraphs_from_words(alternative, diarize)
 
 
-def _extract_deepgram_paragraphs_from_words(alternative, diarize: bool) -> list[dict]:
+def _extract_deepgram_paragraphs_from_words(
+    alternative,
+    diarize: bool,
+    low_confidence_threshold: float | None = None,
+) -> list[dict]:
     """Word-loop fallback for paragraph extraction with timing.
 
     Splits on speaker changes (when diarized) or pauses ≥1.5 s (always),
@@ -1042,6 +1147,10 @@ def _extract_deepgram_paragraphs_from_words(alternative, diarize: bool) -> list[
     used by :func:`_format_diarized_from_words`, just with timing
     preserved so the timestamped assembler can place ``[HH:MM:SS]``
     markers and dedup overlap regions.
+
+    Forwards ``low_confidence_threshold`` to the per-word renderer so
+    confidence wrapping composes cleanly with the timestamped output
+    path.
     """
     words = getattr(alternative, "words", None)
     if not words:
@@ -1072,9 +1181,7 @@ def _extract_deepgram_paragraphs_from_words(alternative, diarize: bool) -> list[
         speaker = getattr(word, "speaker", None)
         word_start = getattr(word, "start", None)
         word_end = getattr(word, "end", None)
-        word_text = (
-            getattr(word, "punctuated_word", None) or getattr(word, "word", "")
-        )
+        word_text = _render_word_token(word, low_confidence_threshold)
 
         is_pause = (
             last_word_end is not None
@@ -1156,6 +1263,31 @@ def _extract_whisper_paragraphs(response) -> list[dict]:
     return out
 
 
+def _render_word_token(word, low_confidence_threshold: float | None) -> str:
+    """Return the surface text for a single Deepgram word, optionally
+    wrapped in ``~~…~~`` markers when its confidence is at or below
+    ``low_confidence_threshold``.
+
+    Wrapping the *whole* token (punctuation included) keeps the marker
+    syntax simple enough that the preview renderer and the export
+    sanitiser can both treat it as a single fenced span — same shape
+    the filler-word pipeline already uses with ``_word_``.
+    Returns an empty string when the word has no surface text so the
+    caller can simply skip empty tokens.
+    """
+    text = (
+        getattr(word, "punctuated_word", None)
+        or getattr(word, "word", "")
+        or ""
+    )
+    if not text or low_confidence_threshold is None:
+        return text
+    confidence = getattr(word, "confidence", None)
+    if confidence is None or confidence > low_confidence_threshold:
+        return text
+    return f"~~{text}~~"
+
+
 def _format_diarized_from_paragraphs(alternative) -> str | None:
     """Build a ``**Speaker N:**\\n<text>`` transcript from Deepgram's
     ``paragraphs`` structure.
@@ -1195,12 +1327,19 @@ def _format_diarized_from_paragraphs(alternative) -> str | None:
     return "\n\n".join(parts)
 
 
-def _format_diarized_from_words(alternative) -> str:
+def _format_diarized_from_words(
+    alternative,
+    low_confidence_threshold: float | None = None,
+) -> str:
     """Word-loop fallback used when ``alternative.paragraphs`` is absent.
 
     Walks the per-word output, starting a new ``**Speaker N:**`` block on
     every speaker change or pause longer than 1.5 seconds. Returns an
     empty string when no words are present.
+
+    When ``low_confidence_threshold`` is set, individual words at or
+    below that confidence are wrapped via :func:`_render_word_token`
+    so the preview UI can highlight them.
     """
     words = getattr(alternative, "words", None)
     if not words or len(words) == 0:
@@ -1218,8 +1357,7 @@ def _format_diarized_from_words(alternative) -> str:
         speaker = getattr(word, "speaker", None)
         word_start = getattr(word, "start", None)
         word_end = getattr(word, "end", None)
-        # Use punctuated_word if available (has punctuation), else fall back to word
-        word_text = getattr(word, "punctuated_word", None) or getattr(word, "word", "")
+        word_text = _render_word_token(word, low_confidence_threshold)
 
         # Detect pause: gap between last word end and this word start
         is_pause = False
