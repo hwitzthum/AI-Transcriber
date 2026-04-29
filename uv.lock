@@ -1437,6 +1437,7 @@ dependencies = [
     { name = "openai" },
     { name = "python-docx" },
     { name = "streamlit" },
+    { name = "tenacity" },
 ]
 
 [package.optional-dependencies]
@@ -1453,6 +1454,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4.0" },
     { name = "python-docx", specifier = ">=1.2.0" },
     { name = "streamlit", specifier = ">=1.54.0" },
+    { name = "tenacity", specifier = ">=8.0.0" },
 ]
 provides-extras = ["dev"]
 
