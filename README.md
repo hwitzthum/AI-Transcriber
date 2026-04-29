@@ -30,6 +30,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 - **Search & highlight** — Find and highlight any word or phrase in the preview
 - **Timestamps** — Optional `[HH:MM:SS]` markers at every paragraph and speaker change, rendered in the editor and embedded in DOCX/PDF exports
 - **Confidence highlighting** — Optional amber highlight on words Deepgram was least sure of, so manual review focuses on the parts that actually need it (Deepgram only)
+- **AI summary** — Optional post-transcription LLM call (OpenAI or Groq) producing an executive summary, key topics, and action items; embedded in the editor and the DOCX/PDF exports
 
 ### Editor
 - **Edit / Preview modes** — Toggle between raw text editing and a formatted visual preview
@@ -97,6 +98,20 @@ Under **Spoken Language**, choose:
 - **A specific language** — set explicitly for best accuracy on single-language files. The dropdown covers 30+ languages including Arabic, Chinese, Dutch, German, Hindi, Japanese, Korean, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian, and Vietnamese.
 
 > **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 (Multilingual)** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
+
+---
+
+### 3c. Generate an AI Summary (Optional)
+
+Tick **Generate after transcription** under "AI summary" in the sidebar. After every successful transcription the app calls a small LLM (Groq llama-3.3-70b by default; OpenAI gpt-4o-mini as an alternative) to produce:
+
+- **Executive summary** — 3–5 sentences in the source language
+- **Key topics** — 3–7 short phrases ordered by importance
+- **Action items** — every explicit commitment, with speaker attribution where available; empty list when none are present (the prompt is explicit about *not* inventing them)
+
+The result appears above the editor and is embedded in both DOCX and PDF exports. Editing the transcript invalidates the cached summary so a "Regenerate summary" button is shown — you decide whether the edit warrants a fresh call. When the transcription provider matches the summary provider's family (Groq/OpenAI), the same API key is reused.
+
+In batch mode each file gets its own summary in its DOCX/PDF when the option is enabled.
 
 ---
 
@@ -223,6 +238,7 @@ Transcriber/
 │   ├── __init__.py
 │   ├── audio_processor.py   # Format conversion, chunking, ffprobe metadata
 │   ├── cloud_engine.py      # OpenAI / Groq / Deepgram API, retry logic, deduplication
+│   ├── ai_summary.py        # LLM post-processing: summary + topics + actions
 │   ├── batch.py             # Batch transcription helpers and zip builder
 │   ├── exporter.py          # DOCX and PDF export with speaker formatting
 │   ├── language.py          # ISO-639-1 normalization for detected languages
@@ -232,6 +248,7 @@ Transcriber/
 │   ├── test_all.py            # Core test suite (audio, chunking, export)
 │   ├── test_cloud_engine.py   # Cloud engine unit tests (retry, dedup, garbage detection)
 │   ├── test_language.py       # Language code normalization
+│   ├── test_ai_summary.py     # AI post-processing (mocked LLM)
 │   ├── test_batch.py          # Batch helpers (zip layout, chunk cleanup)
 │   ├── test_confidence_highlight.py
 │   ├── test_redact_secrets.py # Verifies API keys are stripped from error messages

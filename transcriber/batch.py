@@ -123,10 +123,12 @@ def build_zip(per_file: list[dict]) -> bytes:
 
             zf.writestr(f"{stem}/transcription.txt", text)
 
+            summary = entry.get("summary")
+
             try:
                 zf.writestr(
                     f"{stem}/transcription.docx",
-                    exporter.export_docx(text, title=stem),
+                    exporter.export_docx(text, title=stem, summary=summary),
                 )
             except Exception as exc:  # noqa: BLE001 — partial output beats none
                 zf.writestr(f"{stem}/docx_error.txt", str(exc))
@@ -134,7 +136,7 @@ def build_zip(per_file: list[dict]) -> bytes:
             try:
                 zf.writestr(
                     f"{stem}/transcription.pdf",
-                    exporter.export_pdf(text, title=stem),
+                    exporter.export_pdf(text, title=stem, summary=summary),
                 )
             except Exception as exc:  # noqa: BLE001 — partial output beats none
                 zf.writestr(f"{stem}/pdf_error.txt", str(exc))

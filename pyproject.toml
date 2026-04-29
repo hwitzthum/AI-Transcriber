@@ -21,3 +21,17 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
 ]
+
+[tool.pytest.ini_options]
+# Treat warnings as errors so a new deprecation can't quietly creep
+# in. Listed exemptions are third-party noise we cannot fix in this
+# repo:
+#   * deepgram-sdk's transitive ``websockets.legacy`` import. The
+#     websockets ecosystem is mid-migration; the SDK's modernised
+#     replacement isn't released yet, so silencing the specific
+#     message is the right call rather than swallowing all
+#     DeprecationWarnings.
+filterwarnings = [
+    "error",
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]
