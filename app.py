@@ -141,14 +141,25 @@ st.set_page_config(
 try:
     audio_processor.require_ffmpeg()
 except RuntimeError as _ffmpeg_err:
-    st.error(f"❌ {_ffmpeg_err}")
+    st.error(str(_ffmpeg_err))
     st.stop()
 
-# ── Custom CSS — "Studio Noir" Design System ─────────────────────────────────
+# ── Custom CSS ────────────────────────────────────────────────────────────────
 
-# CSS lives in assets/styles.css. Keeping ~700 lines of stylesheet
-# inside this Python file made app.py impractical to navigate and
-# excluded the styles from any CSS-aware tooling.
+# Web fonts: inject <link> tags via st.html. @import inside an st.markdown
+# <style> block is stripped by Streamlit's HTML sanitizer, producing zero
+# font requests at runtime — the link-tag route is the reliable one.
+st.html(
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link rel="stylesheet" href="'
+    'https://fonts.googleapis.com/css2'
+    '?family=Fraunces:opsz,wght,SOFT@9..144,500..800,0..100'
+    '&family=Inter+Tight:wght@400..700'
+    '&family=JetBrains+Mono:wght@400;500;600'
+    '&display=swap">'
+)
+
 _STYLES_PATH = Path(__file__).parent / "assets" / "styles.css"
 st.markdown(_STYLES_PATH.read_text(encoding="utf-8"), unsafe_allow_html=True)
 
@@ -165,35 +176,22 @@ if "audio_info" not in st.session_state:
 
 
 with st.sidebar:
-    # Sidebar branding
+    # Sidebar brand mark
     st.markdown("""
-    <div style="margin-bottom: 2rem;">
-        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
-            <div style="
-                width: 36px;
-                height: 36px;
-                background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 50%, #d97706 100%);
-                border-radius: 10px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 1.1rem;
-                box-shadow: 0 0 20px rgba(251,191,36,0.2);
-            ">🎙️</div>
-            <span style="
-                font-family: 'Playfair Display', Georgia, serif;
-                font-size: 1.4rem;
-                font-weight: 700;
-                color: #fafafa;
-            ">Transcriber</span>
+    <div class="brand-mark">
+        <div class="brand-mark-row">
+            <svg class="brand-mark-icon" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <rect x="1" y="1" width="38" height="38" rx="2" stroke="#a87838" stroke-width="1.2" fill="none"/>
+                <g stroke="#a87838" stroke-width="1.6" stroke-linecap="round">
+                    <line x1="14" y1="16" x2="14" y2="24"/>
+                    <line x1="17" y1="13" x2="17" y2="27"/>
+                    <line x1="20" y1="10" x2="20" y2="30"/>
+                    <line x1="23" y1="13" x2="23" y2="27"/>
+                    <line x1="26" y1="16" x2="26" y2="24"/>
+                </g>
+            </svg>
+            <div class="brand-mark-name">Transcriber<em>.</em></div>
         </div>
-        <p style="
-            font-family: 'Source Sans 3', sans-serif;
-            font-size: 0.8rem;
-            color: #71717a;
-            margin: 0;
-            letter-spacing: 0.02em;
-        ">AI-Powered Audio Transcription</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -212,8 +210,7 @@ with st.sidebar:
     api_key_key = f"{cloud_provider}_key"  # Unique key per provider
 
     st.markdown(
-        f'<p style="font-size: 0.8rem; color: #a1a1aa; margin-bottom: 6px;">'
-        f'{cloud_provider.split()[0]} API Key</p>',
+        f'<p class="sidebar-field-label">{cloud_provider.split()[0]} API Key</p>',
         unsafe_allow_html=True,
     )
     api_key = st.text_input(
@@ -235,14 +232,15 @@ with st.sidebar:
         )
         if "Multilingual" in cloud_provider:
             st.markdown(
-                '<p style="font-size: 0.75rem; color: #71717a; margin-top: 4px;">'
-                '✦ Nova-3 handles mixed-language audio automatically</p>',
+                '<p class="sidebar-hint sidebar-hint--mono">'
+                'Nova-3 handles mixed-language audio automatically'
+                '</p>',
                 unsafe_allow_html=True,
             )
 
     # Language selection
     st.divider()
-    st.markdown("### Spoken language")
+    st.markdown("### Spoken Language")
 
     # Standard languages list (simplified for cloud)
     LANGUAGES = {
@@ -269,68 +267,28 @@ with st.sidebar:
     )
     language_code = LANGUAGES[language_name]
     st.markdown(
-        '<p style="font-size: 0.75rem; color: #71717a; margin-top: 4px;">'
+        '<p class="sidebar-hint">'
         "Transcribed in the original language — never translated. "
         "For mixed-language audio, use Nova-3 (Multilingual)."
         "</p>",
         unsafe_allow_html=True,
     )
 
-    # Footer
-    st.divider()
-    st.markdown("""
-    <div style="margin-top: 1rem;">
-        <p style="
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.7rem;
-            color: #52525b;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            margin-bottom: 4px;
-        ">System</p>
-        <div style="
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        ">
-            <span style="
-                width: 6px;
-                height: 6px;
-                background: #22c55e;
-                border-radius: 50%;
-                box-shadow: 0 0 8px #22c55e;
-            "></span>
-            <span style="
-                font-family: 'Source Sans 3', sans-serif;
-                font-size: 0.8rem;
-                color: #a1a1aa;
-            ">Cloud Mode Active</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
 
 # ── Main area ────────────────────────────────────────────────────────────────
 
-# Hero Section
+# Header
 st.markdown("""
-<div class="studio-hero">
-    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem;">
-        <div class="studio-logo">
-            <div class="studio-icon">🎙️</div>
-            <div>
-                <h1 class="studio-title">Transcriber</h1>
-                <p class="studio-subtitle" style="margin: 0;">Transform audio into accurate, readable text</p>
-            </div>
-        </div>
-        <div class="studio-badge">
-            <div class="studio-waveform">
-                <span></span><span></span><span></span><span></span><span></span>
-            </div>
-            AI-Powered
-        </div>
+<header class="header">
+    <div class="header-title-block">
+        <p class="header-eyebrow">Audio &amp; video transcription</p>
+        <h1 class="header-title">Transcriber<em>.</em></h1>
+        <p class="header-deck">
+            Turn recordings into accurate, speaker-labelled text using Deepgram, OpenAI Whisper, or Groq.
+            English, German, French, Spanish, Italian &mdash; or auto-detect.
+        </p>
     </div>
-</div>
+</header>
 """, unsafe_allow_html=True)
 
 # ── Input section ────────────────────────────────────────────────────────────
@@ -338,12 +296,10 @@ st.markdown("""
 col_upload, col_path = st.columns(2)
 
 with col_upload:
-    st.markdown("""
-    <div class="studio-section-header">
-        <div class="studio-section-icon">📁</div>
-        <p class="studio-section-title">Upload File</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-eyebrow"><span class="num">01</span> Upload file</div>',
+        unsafe_allow_html=True,
+    )
     uploaded_file = st.file_uploader(
         "Drop your audio or video file here",
         type=["mp3", "wav", "m4a", "flac", "ogg", "wma", "aac", "opus", "webm", "mp4", "mov", "avi", "mkv"],
@@ -352,12 +308,10 @@ with col_upload:
     )
 
 with col_path:
-    st.markdown("""
-    <div class="studio-section-header">
-        <div class="studio-section-icon">📂</div>
-        <p class="studio-section-title">Or Enter Path</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-eyebrow"><span class="num">02</span> Or enter a local path</div>',
+        unsafe_allow_html=True,
+    )
     file_path_input = st.text_input(
         "Absolute path to audio/video file",
         placeholder="/path/to/your/audio.mp3",
@@ -379,7 +333,7 @@ if uploaded_file is not None:
         cap_mb = _MAX_UPLOAD_BYTES / (1024 * 1024)
         size_mb = uploaded_file.size / (1024 * 1024)
         st.error(
-            f"❌ File is too large ({size_mb:.0f} MB). The current limit is "
+            f"File is too large ({size_mb:.0f} MB). The current limit is "
             f"{cap_mb:.0f} MB."
         )
         st.stop()
@@ -387,14 +341,14 @@ if uploaded_file is not None:
     audio_file_path = _get_cached_upload_path(uploaded_file)
     temp_upload_path = audio_file_path
     file_size_mb = uploaded_file.size / (1024 * 1024) if uploaded_file.size > 0 else 0
-    st.success(f"✅ Loaded: **{uploaded_file.name}** ({file_size_mb:.1f} MB)")
+    st.success(f"Loaded · **{uploaded_file.name}** &nbsp;·&nbsp; {file_size_mb:.1f} MB")
 elif file_path_input.strip():
     valid, msg = audio_processor.validate_file(file_path_input.strip())
     if valid:
         audio_file_path = file_path_input.strip()
-        st.success(f"✅ File found: **{os.path.basename(audio_file_path)}**")
+        st.success(f"Resolved · **{os.path.basename(audio_file_path)}**")
     else:
-        st.error(f"❌ {msg}")
+        st.error(msg)
 
 
 # ── Audio info & Transcribe button ──────────────────────────────────────────
@@ -408,10 +362,10 @@ if audio_file_path:
 
         # Display audio info
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("⏱️ Duration", info["duration_formatted"])
-        col2.metric("📦 Size", f"{info['file_size_mb']:.1f} MB")
-        col3.metric("🔊 Channels", info["channels"])
-        col4.metric("📊 Sample Rate", f"{info['sample_rate']} Hz")
+        col1.metric("Duration", info["duration_formatted"])
+        col2.metric("File Size", f"{info['file_size_mb']:.1f} MB")
+        col3.metric("Channels", info["channels"])
+        col4.metric("Sample Rate", f"{info['sample_rate']} Hz")
 
         # Use the chosen provider's upload limit so the "needs chunking" hint
         # only fires when this specific provider would actually need it.
@@ -422,10 +376,10 @@ if audio_file_path:
             provider_max_chunk_bytes,
         )
         if needs_split:
-            st.info("📎 This file is large and will be split into chunks for processing.")
+            st.info("This file is large and will be split into chunks for processing.")
 
     except Exception as e:
-        st.error(f"❌ Could not read audio file: {e}")
+        st.error(f"Could not read audio file — {e}")
         audio_file_path = None
 
 
@@ -434,10 +388,10 @@ if audio_file_path:
 if audio_file_path:
     st.divider()
     
-    if st.button("🚀 Start Transcription", type="primary", use_container_width=True, disabled=st.session_state.get("is_transcribing", False)):
+    if st.button("Begin Transcription", type="primary", use_container_width=True, disabled=st.session_state.get("is_transcribing", False)):
         
         if not api_key or not api_key.strip():
-            st.error("❌ Please enter your API key in the sidebar.")
+            st.error("Please enter your API key in the sidebar.")
             st.stop()
         
         st.session_state.is_transcribing = True
@@ -447,14 +401,14 @@ if audio_file_path:
         def update_progress(current, total, message):
             if total > 0:
                 progress_bar.progress(current / total)
-            status_text.markdown(f"⏳ **{message}**")
+            status_text.markdown(f"**{message}**")
         
         # Initialised before the try so the finally block is safe even if
         # chunk_audio() itself raises before returning a list.
         chunk_paths: list[str] = []
         try:
             # Step 1: Chunk the audio (using provider-specific upload ceiling).
-            status_text.markdown("⏳ **Preparing audio...**")
+            status_text.markdown("**Preparing audio…**")
             chunk_paths = audio_processor.chunk_audio(
                 audio_file_path,
                 progress_callback=update_progress,
@@ -485,7 +439,7 @@ if audio_file_path:
             st.session_state.is_transcribing = False
 
             progress_bar.progress(1.0)
-            status_text.markdown("✅ **Transcription complete!**")
+            status_text.markdown("**Transcription complete.**")
 
             # Show detected language if auto-detect was used,
             # or warn the user when their forced selection disagrees with what
@@ -514,7 +468,7 @@ if audio_file_path:
                         detected_iso.upper() if detected_iso else detected_language
                     )
                     st.warning(
-                        f"⚠️ You selected **{language_name}** but the audio sounds like "
+                        f"You selected **{language_name}** but the audio sounds like "
                         f"**{display}**. The transcript may be garbled. "
                         "Re-run with Auto-detect, or pick the matching language."
                     )
@@ -577,10 +531,13 @@ if audio_file_path:
 
 if st.session_state.transcript:
     st.divider()
-    st.markdown("### ✏️ Edit Transcription")
+    st.markdown(
+        '<div class="section-eyebrow"><span class="num">03</span> Edit transcript</div>',
+        unsafe_allow_html=True,
+    )
 
     # ── Readability Options ──────────────────────────────────────────────────
-    with st.expander("📖 Readability Options", expanded=False):
+    with st.expander("Readability options", expanded=False):
         st.info(
             "**Paragraph breaks** are automatically inserted at natural pauses "
             "(>1.5 seconds of silence) when using Deepgram with speaker diarization."
@@ -602,7 +559,7 @@ if st.session_state.transcript:
     # ── Speaker Renaming ─────────────────────────────────────────────────────
     speakers = text_processor.extract_speakers(st.session_state.transcript)
     if speakers:
-        with st.expander("👥 Rename Speakers", expanded=False):
+        with st.expander("Rename speakers", expanded=False):
             st.caption("Replace generic speaker labels with actual names")
 
             # Initialize speaker names in session state
@@ -648,8 +605,8 @@ if st.session_state.transcript:
     if view_mode == "Preview":
         with col_search:
             search_query = st.text_input(
-                "🔍 Search",
-                placeholder="Search transcript...",
+                "Search",
+                placeholder="Search the transcript…",
                 label_visibility="collapsed",
             )
 
@@ -680,17 +637,27 @@ if st.session_state.transcript:
         )
         edited_text = st.session_state.transcript
 
-    # Reading stats
+    # Reading stats — line under the transcript
     stats = _cached_reading_stats(edited_text)
     reading_time = stats["reading_time_minutes"]
     if reading_time < 1:
-        time_str = f"{int(reading_time * 60)}s read"
+        time_str = f"{int(reading_time * 60)}s"
     else:
-        time_str = f"{reading_time:.1f}m read"
-    st.caption(f"📝 {stats['word_count']:,} words · {stats['char_count']:,} characters · ⏱️ {time_str}")
+        time_str = f"{reading_time:.1f} min"
+    st.markdown(
+        f'<div class="reading-stats">'
+        f'<span><span class="stat-num">{stats["word_count"]:,}</span> words</span>'
+        f'<span><span class="stat-num">{stats["char_count"]:,}</span> characters</span>'
+        f'<span><span class="stat-num">{time_str}</span> reading time</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     # ── Export Section ───────────────────────────────────────────────────────
-    st.markdown("### 📥 Download")
+    st.markdown(
+        '<div class="section-eyebrow"><span class="num">04</span> Download</div>',
+        unsafe_allow_html=True,
+    )
 
     col_docx, col_pdf = st.columns(2)
 
@@ -698,7 +665,7 @@ if st.session_state.transcript:
         if edited_text.strip():
             docx_bytes = _cached_export_docx(edited_text, "Transcription")
             st.download_button(
-                label="📄 Download DOCX",
+                label="Download · DOCX",
                 data=docx_bytes,
                 file_name="transcription.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -710,7 +677,7 @@ if st.session_state.transcript:
             try:
                 pdf_bytes = _cached_export_pdf(edited_text, "Transcription")
                 st.download_button(
-                    label="📕 Download PDF",
+                    label="Download · PDF",
                     data=pdf_bytes,
                     file_name="transcription.pdf",
                     mime="application/pdf",
