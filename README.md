@@ -12,6 +12,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 - **Speaker diarization** — Identifies individual speakers (Deepgram only)
 - **Large file support** — Automatic chunking and memory-efficient streaming for files of any size
 - **Video support** — Extracts audio from MP4, MOV, AVI, MKV, and more
+- **URL input** — Paste a YouTube, podcast, or direct media URL; the audio is downloaded and transcribed without leaving the app
 - **All audio formats** — MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, WEBM, and more
 
 ### Output Quality
@@ -116,13 +117,14 @@ Paragraphs are automatically inserted at:
 
 ---
 
-### 4. Upload Your File
+### 4. Provide Your Audio
 
-Either:
-- **Drag and drop** a file into the upload area, or
+Three options:
+- **Drag and drop** a file into the upload area
 - **Paste a file path** (e.g., `/Users/you/meeting.mp4`) into the path field
+- **Paste a URL** (YouTube video, podcast episode, or direct media link) and click **Fetch URL**
 
-Audio info (duration, size, sample rate) is displayed immediately. Large files will be split into chunks automatically — you will see a notice.
+For uploads and paths, audio info (duration, size, sample rate) is displayed immediately. For URLs, click **Fetch URL** first; the audio is downloaded into a temp file via yt-dlp + ffmpeg, then audio info appears. Large files will be split into chunks automatically — you will see a notice.
 
 ---
 
@@ -200,13 +202,15 @@ Transcriber/
 │   ├── cloud_engine.py      # OpenAI / Groq / Deepgram API, retry logic, deduplication
 │   ├── exporter.py          # DOCX and PDF export with speaker formatting
 │   ├── language.py          # ISO-639-1 normalization for detected languages
-│   └── text_processor.py    # Filler detection, speaker renaming, search highlight
+│   ├── text_processor.py    # Filler detection, speaker renaming, search highlight
+│   └── url_source.py        # yt-dlp wrapper for downloading audio from URLs
 ├── tests/
 │   ├── test_all.py            # Core test suite (audio, chunking, export)
 │   ├── test_cloud_engine.py   # Cloud engine unit tests (retry, dedup, garbage detection)
 │   ├── test_language.py       # Language code normalization
 │   ├── test_redact_secrets.py # Verifies API keys are stripped from error messages
 │   ├── test_text_processor.py
+│   ├── test_url_source.py     # yt-dlp wrapper unit tests (mocked)
 │   └── _make_test_video.py    # Manual fixture regen (not run by pytest)
 ├── pyproject.toml
 └── README.md
