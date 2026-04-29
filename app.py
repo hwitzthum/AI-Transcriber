@@ -253,6 +253,21 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
 
+    # Timestamps option — independent of provider, since both Deepgram
+    # paragraphs and Whisper verbose_json segments carry the timing data
+    # we need. Off by default to keep transcripts clean for users who
+    # only want prose; opt-in produces ``[HH:MM:SS]`` markers per
+    # paragraph in both the editor and the exports.
+    include_timestamps = st.checkbox(
+        "Include timestamps",
+        value=False,
+        help=(
+            "Insert [HH:MM:SS] markers at every paragraph and speaker change. "
+            "Visible in the editor and embedded in DOCX/PDF exports — "
+            "useful for navigating long recordings."
+        ),
+    )
+
     # Language selection
     st.divider()
     st.markdown("### Spoken Language")
@@ -544,11 +559,23 @@ if audio_file_path:
             # duplicate ffprobe spawn.
             status_text.markdown("**Preparing audio…**")
             cached_info = st.session_state.get("audio_info") or {}
+            provider_max_chunk_bytes = cloud_engine.get_max_chunk_bytes(cloud_provider)
             total_chunks, raw_chunk_iter = audio_processor.iter_chunks(
                 audio_file_path,
                 progress_callback=update_progress,
-                max_bytes=cloud_engine.get_max_chunk_bytes(cloud_provider),
+                max_bytes=provider_max_chunk_bytes,
                 duration_seconds=cached_info.get("duration_seconds"),
+            )
+
+            # Chunk-start offsets for the timestamped path. Computed up
+            # front so cloud_engine can translate each chunk's
+            # zero-based timestamps back into absolute file time. We
+            # always compute them — the call is a few microseconds and
+            # passing None when timestamps are off costs nothing.
+            chunk_offsets = audio_processor.compute_chunk_offsets(
+                duration_seconds=cached_info.get("duration_seconds") or 0.0,
+                file_size_bytes=os.path.getsize(audio_file_path),
+                max_bytes=provider_max_chunk_bytes,
             )
 
             def _collecting_iter():
@@ -574,6 +601,8 @@ if audio_file_path:
                 language=language_code,
                 progress_callback=update_progress,
                 diarize=diarize_flag,
+                include_timestamps=include_timestamps,
+                chunk_offsets=chunk_offsets,
             )
 
             transcript = result["text"]

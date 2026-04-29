@@ -219,6 +219,31 @@ def needs_chunking(file_path: str, max_bytes: int = MAX_CHUNK_BYTES) -> bool:
     return os.path.getsize(file_path) > max_bytes
 
 
+def compute_chunk_offsets(
+    duration_seconds: float,
+    file_size_bytes: int,
+    max_bytes: int = MAX_CHUNK_BYTES,
+) -> list[float]:
+    """Return the start offset in seconds for each chunk this file would
+    produce if passed through :func:`iter_chunks`.
+
+    Single-chunk uploads (file fits under ``max_bytes``) return ``[0.0]``.
+    Multi-chunk uploads return one offset per chunk, matching the
+    indexing used by the streaming transcription pool — so consumers
+    that need to translate per-chunk timestamps into absolute file time
+    (e.g. inserting ``[HH:MM:SS]`` markers into the transcript) can
+    look up offsets by chunk index.
+
+    The arithmetic mirrors :func:`_plan_ffmpeg_chunks` — keep the two in
+    sync, otherwise inserted timestamps would drift relative to the
+    actual chunk boundaries.
+    """
+    if file_size_bytes <= max_bytes:
+        return [0.0]
+    _, step_sec, num_chunks = _plan_ffmpeg_chunks(duration_seconds, max_bytes)
+    return [i * step_sec for i in range(num_chunks)]
+
+
 def iter_chunks(
     file_path: str,
     progress_callback=None,

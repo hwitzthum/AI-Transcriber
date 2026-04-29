@@ -19,6 +19,10 @@ from fpdf import FPDF
 # Speaker-only regex here on purpose.
 _FILLER_PATTERN = re.compile(r"_([^_]+)_")
 
+# Leading ``[HH:MM:SS]`` marker stripped off before we look for the
+# speaker label. Same shape the timestamped-transcript pipeline emits.
+_LEADING_TIMESTAMP = re.compile(r"^\s*\[(\d{2}:\d{2}:\d{2})\]\s*")
+
 
 # Module-level font cache: font_path for the Unicode font
 _cached_font_path: Optional[str] = None
@@ -95,32 +99,48 @@ def _create_pdf_with_unicode_font() -> Tuple[FPDF, str]:
     return pdf, "Helvetica"
 
 
-def _parse_speaker_block(block: str) -> Tuple[Optional[str], str]:
+def _parse_speaker_block(block: str) -> Tuple[Optional[str], Optional[str], str]:
     """
-    Parse a text block to extract speaker label and content.
+    Parse a text block to extract optional timestamp, speaker label, and content.
+
+    Handles four shapes the transcript pipeline can produce:
+
+    1. ``**Speaker X:**\\n<content>``                    — diarized, no timestamp
+    2. ``[HH:MM:SS] **Speaker X:**\\n<content>``         — diarized + timestamped
+    3. ``[HH:MM:SS]\\n<content>``                        — non-diarized + timestamped
+    4. ``<content>``                                     — plain prose
 
     Args:
-        block: A text block that may start with **Speaker X:**
+        block: A text block from the transcript (one of the shapes above).
 
     Returns:
-        Tuple of (speaker_label, content) where speaker_label is None if no speaker found.
-        Speaker label is returned without the ** markers.
+        ``(timestamp, speaker_label, content)`` where each of the first
+        two may be ``None``. Timestamp is returned as ``HH:MM:SS`` (no
+        brackets); speaker label is returned without the ``**`` markers.
     """
-    lines = block.strip().split("\n", 1)
-    if not lines:
-        return None, ""
+    stripped = block.strip()
+    if not stripped:
+        return None, None, ""
 
+    # Peel off a leading [HH:MM:SS] marker first so the speaker check
+    # below sees the same shape regardless of whether timestamps are on.
+    timestamp: Optional[str] = None
+    ts_match = _LEADING_TIMESTAMP.match(stripped)
+    if ts_match:
+        timestamp = ts_match.group(1)
+        stripped = stripped[ts_match.end():].lstrip()
+
+    lines = stripped.split("\n", 1)
     first_line = lines[0].strip()
+    rest = lines[1].strip() if len(lines) > 1 else ""
 
-    # Check if first line is a speaker label like **Speaker 0:** or **CustomName:**
     match = re.match(r"^\*\*(.+?):\*\*$", first_line)
     if match:
         speaker_label = f"{match.group(1)}:"
-        content = lines[1].strip() if len(lines) > 1 else ""
-        return speaker_label, content
+        return timestamp, speaker_label, rest
 
-    # No speaker label - return entire block as content
-    return None, block.strip()
+    # No speaker label — the whole timestamp-stripped block is content.
+    return timestamp, None, stripped
 
 
 def _parse_text_segments(text: str) -> List[Tuple[str, bool]]:
@@ -228,15 +248,22 @@ def export_docx(text: str, title: str = "Transcription") -> bytes:
         if not para_text:
             continue
 
-        speaker_label, content = _parse_speaker_block(para_text)
+        timestamp, speaker_label, content = _parse_speaker_block(para_text)
 
         if speaker_label:
-            # Add speaker label as bold paragraph
+            # Speaker label paragraph: optional timestamp prefix in muted
+            # gray, then the speaker name in bold blue. One paragraph so
+            # the eye reads "[time] · Speaker:" as a single header line.
             speaker_para = doc.add_paragraph()
+            if timestamp:
+                ts_run = speaker_para.add_run(f"[{timestamp}]  ")
+                ts_run.font.size = Pt(9)
+                ts_run.font.color.rgb = RGBColor(0x9c, 0xa3, 0xaf)
+                ts_run.font.name = "Consolas"
             speaker_run = speaker_para.add_run(speaker_label)
             speaker_run.bold = True
             speaker_run.font.size = Pt(11)
-            speaker_run.font.color.rgb = RGBColor(0x1a, 0x56, 0xdb)  # Blue color for speaker
+            speaker_run.font.color.rgb = RGBColor(0x1a, 0x56, 0xdb)
             speaker_para.paragraph_format.space_after = Pt(2)
 
             # Add content paragraph with filler word formatting
@@ -246,9 +273,19 @@ def export_docx(text: str, title: str = "Transcription") -> bytes:
                 content_para.paragraph_format.space_after = Pt(12)
                 content_para.paragraph_format.left_indent = Inches(0.25)
         else:
-            # Regular paragraph with filler word formatting
+            # Plain paragraph (possibly preceded by a timestamp). The
+            # timestamp goes on its own line in muted gray so the body
+            # text isn't visually broken up.
+            if timestamp:
+                ts_para = doc.add_paragraph()
+                ts_run = ts_para.add_run(f"[{timestamp}]")
+                ts_run.font.size = Pt(9)
+                ts_run.font.color.rgb = RGBColor(0x9c, 0xa3, 0xaf)
+                ts_run.font.name = "Consolas"
+                ts_para.paragraph_format.space_after = Pt(2)
+
             para = doc.add_paragraph()
-            _add_formatted_text_to_paragraph(para, para_text)
+            _add_formatted_text_to_paragraph(para, content)
             para.paragraph_format.space_after = Pt(8)
 
     # Save to bytes buffer
@@ -310,12 +347,19 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
         if not para_text:
             continue
 
-        speaker_label, content = _parse_speaker_block(para_text)
+        timestamp, speaker_label, content = _parse_speaker_block(para_text)
 
         if speaker_label:
-            # Speaker label: blue, slightly larger
+            # Optional [HH:MM:SS] prefix in muted gray on its own line
+            # above the speaker label, so the speaker name still stands
+            # out as the visual anchor for the block.
+            if timestamp:
+                pdf.set_font(body_font, "", 9)
+                pdf.set_text_color(156, 163, 175)
+                pdf.cell(0, 5, f"[{timestamp}]", new_x="LMARGIN", new_y="NEXT")
+
             pdf.set_font(body_font, "", 12)
-            pdf.set_text_color(26, 86, 219)  # Blue color for speaker
+            pdf.set_text_color(26, 86, 219)
             pdf.cell(0, 7, speaker_label, new_x="LMARGIN", new_y="NEXT")
 
             # Content: normal text, slightly indented (strip filler markers)
@@ -326,10 +370,15 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
                 pdf.multi_cell(0, 6, _strip_filler_markers(content))
             pdf.ln(6)
         else:
-            # Regular paragraph (strip filler markers)
+            # Plain paragraph; same muted-timestamp treatment as above.
+            if timestamp:
+                pdf.set_font(body_font, "", 9)
+                pdf.set_text_color(156, 163, 175)
+                pdf.cell(0, 5, f"[{timestamp}]", new_x="LMARGIN", new_y="NEXT")
+
             pdf.set_font(body_font, "", 11)
             pdf.set_text_color(51, 51, 51)
-            pdf.multi_cell(0, 6, _strip_filler_markers(para_text))
+            pdf.multi_cell(0, 6, _strip_filler_markers(content))
             pdf.ln(4)
 
     # Output as bytes - handle bytes, bytearray, and string return types from fpdf2

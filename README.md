@@ -27,6 +27,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 - **Speaker renaming** — Replace generic "Speaker 0" labels with actual names (e.g., Maria, John)
 - **Filler word highlighting** — Marks um, uh, äh, euh, like, basically in italic for easy review (English, German, French)
 - **Search & highlight** — Find and highlight any word or phrase in the preview
+- **Timestamps** — Optional `[HH:MM:SS]` markers at every paragraph and speaker change, rendered in the editor and embedded in DOCX/PDF exports
 
 ### Editor
 - **Edit / Preview modes** — Toggle between raw text editing and a formatted visual preview
@@ -94,6 +95,14 @@ Under **Spoken Language**, choose:
 - **A specific language** — set explicitly for best accuracy on single-language files. The dropdown covers 30+ languages including Arabic, Chinese, Dutch, German, Hindi, Japanese, Korean, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian, and Vietnamese.
 
 > **Tip:** For recordings that switch between German and French, select **Deepgram Nova-3 (Multilingual)** and leave language on Auto-detect. Nova-3 handles code-switching within the same sentence.
+
+---
+
+### 3a. Enable Timestamps (Optional)
+
+Tick **Include timestamps** in the sidebar to insert `[HH:MM:SS]` markers at every paragraph and speaker change. They are rendered in the editor (muted gray) and embedded in DOCX/PDF exports — useful for navigating long recordings or producing professional transcripts where every quote needs to be cited to a time.
+
+Works with all providers: Deepgram uses paragraph-level timing from its response; OpenAI Whisper / Groq use segment-level timing from `verbose_json`.
 
 ---
 

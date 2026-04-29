@@ -25,6 +25,11 @@ _FILLER_PATTERN = re.compile(
 # Pattern to detect speaker labels
 _SPEAKER_LABEL_PATTERN = re.compile(r'\*\*Speaker (\d+):\*\*')
 
+# Inline ``[HH:MM:SS]`` markers prepended by the timestamped-transcript
+# path. Anchored with word boundaries so it doesn't match arbitrary
+# bracketed content inside the speaker text.
+_TIMESTAMP_MARKER_PATTERN = re.compile(r'\[(\d{2}:\d{2}:\d{2})\]')
+
 
 def highlight_filler_words(text: str) -> str:
     """
@@ -116,6 +121,13 @@ def render_transcript_html(text: str, search_query: Optional[str] = None) -> str
         r'<em style="color: #9ca3af;">\1</em>',
         escaped,
     )
+    # Timestamps: [HH:MM:SS] → muted monospace badge. Visual weight is
+    # deliberately light so the eye lands on speaker labels and prose
+    # first; the timestamp is for navigation, not reading.
+    escaped = _TIMESTAMP_MARKER_PATTERN.sub(
+        r'<span style="color: #9ca3af; font-family: monospace; font-size: 0.85em;">[\1]</span>',
+        escaped,
+    )
     return escaped
 
 
@@ -153,8 +165,12 @@ def get_reading_stats(text: str) -> dict:
     Returns:
         Dictionary with word_count, char_count, reading_time_minutes.
     """
-    # Remove markdown formatting for accurate count
-    plain_text = re.sub(r'\*\*[^*]+\*\*', '', text)  # Remove bold
+    # Remove markdown formatting and timestamp markers for an accurate count.
+    # Timestamps are inserted by the timestamped-transcript path; without
+    # this strip they'd inflate the word count by one per paragraph and
+    # the character count by ten per paragraph.
+    plain_text = _TIMESTAMP_MARKER_PATTERN.sub('', text)
+    plain_text = re.sub(r'\*\*[^*]+\*\*', '', plain_text)  # Remove bold
     plain_text = re.sub(r'_[^_]+_', '', plain_text)  # Remove italic
     plain_text = plain_text.replace("**", "").replace("_", "")
 

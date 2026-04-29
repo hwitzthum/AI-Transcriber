@@ -240,6 +240,8 @@ def transcribe_chunks(
     diarize: bool = False,
     chunk_overlap_ms: int = 5000,
     max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
+    include_timestamps: bool = False,
+    chunk_offsets: list[float] | None = None,
 ) -> dict:
     """
     Transcribe a fully-prepared list of audio chunks using a cloud API.
@@ -261,6 +263,8 @@ def transcribe_chunks(
         diarize=diarize,
         chunk_overlap_ms=chunk_overlap_ms,
         max_workers=max_workers,
+        include_timestamps=include_timestamps,
+        chunk_offsets=chunk_offsets,
     )
 
 
@@ -274,6 +278,8 @@ def transcribe_chunks_streaming(
     diarize: bool = False,
     chunk_overlap_ms: int = 5000,
     max_workers: int = _DEFAULT_TRANSCRIBE_WORKERS,
+    include_timestamps: bool = False,
+    chunk_offsets: list[float] | None = None,
 ) -> dict:
     """
     Transcribe audio chunks as they arrive from ``chunk_iter``.
@@ -312,6 +318,18 @@ def transcribe_chunks_streaming(
             boundaries.
         max_workers: Maximum concurrent in-flight uploads. Defaults to a
             conservative value that respects provider rate limits.
+        include_timestamps: When True, prepend ``[HH:MM:SS]`` markers to
+            each paragraph in the output and use a paragraph-level
+            time-based dedup (paragraphs whose start time falls inside
+            the prior chunk's coverage are skipped). When False, the
+            existing word-level dedup runs and no timestamp markers are
+            added — preserves the original behaviour exactly.
+        chunk_offsets: Per-chunk start offset in seconds, indexed by
+            chunk number. Required when ``include_timestamps`` is True
+            so per-chunk timestamps (which all start at 0 inside their
+            respective chunk) can be translated into absolute file
+            time. Compute via :func:`audio_processor.compute_chunk_offsets`.
+            Ignored when ``include_timestamps`` is False.
 
     Returns:
         dict with keys:
@@ -493,8 +511,16 @@ def transcribe_chunks_streaming(
     if progress_callback:
         progress_callback(actual_total, actual_total, "Transcription complete!")
 
-    # Deduplicate overlapping regions between consecutive chunk transcripts
-    merged = _deduplicate_overlap(transcripts)
+    if include_timestamps:
+        # Paragraph-level time-based assembly: each chunk's timestamps
+        # are relative to its own start (always begins at 0), so we
+        # offset by the chunk's absolute position and run a
+        # time-overlap dedup before rendering with [HH:MM:SS] markers.
+        offsets = chunk_offsets or [0.0] * total
+        merged = _assemble_with_timestamps(results, offsets, sorted(seen_indices))
+    else:
+        # Word-level dedup over chunk transcripts — original behaviour.
+        merged = _deduplicate_overlap(transcripts)
 
     # Validate the overall transcript
     if not merged.strip():
@@ -562,6 +588,69 @@ def _format_eta_seconds(eta_seconds: float) -> str:
         return f" (ETA ~{int(eta_seconds)}s)"
     minutes, seconds = divmod(int(eta_seconds), 60)
     return f" (ETA ~{minutes}m {seconds}s)"
+
+
+def _format_hms(seconds: float) -> str:
+    """Format an absolute time in seconds as HH:MM:SS for inline markers."""
+    if seconds < 0:
+        seconds = 0.0
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _assemble_with_timestamps(
+    results: list[dict | None],
+    chunk_offsets: list[float],
+    indices: list[int],
+) -> str:
+    """Build a transcript with ``[HH:MM:SS]`` markers from per-chunk paragraphs.
+
+    Each provider's ``_transcribe_*`` returns a ``paragraphs`` list whose
+    timestamps are relative to that chunk's own start (always 0). This
+    helper translates them to absolute file time using ``chunk_offsets``,
+    drops paragraphs that fall inside the previous paragraph's time
+    range (the ~5 s overlap between adjacent chunks would otherwise
+    duplicate text), and renders the result.
+    """
+    all_paragraphs: list[dict] = []
+    for i in indices:
+        result = results[i] or {}
+        paragraphs = result.get("paragraphs") or []
+        offset = chunk_offsets[i] if i < len(chunk_offsets) else 0.0
+        for p in paragraphs:
+            start = p.get("start_sec")
+            end = p.get("end_sec")
+            text = (p.get("text") or "").strip()
+            if not text:
+                continue
+            all_paragraphs.append({
+                "text": text,
+                "start_sec": (start or 0.0) + offset,
+                "end_sec": (end or start or 0.0) + offset,
+                "speaker": p.get("speaker"),
+            })
+
+    # Stable order on start time, then drop time-overlapping duplicates.
+    all_paragraphs.sort(key=lambda p: p["start_sec"])
+
+    rendered: list[str] = []
+    last_end = -float("inf")
+    for p in all_paragraphs:
+        # 0.5 s float-rounding tolerance: a paragraph that starts a hair
+        # before the previous one ends is part of the chunk-overlap
+        # region, not a legitimate adjacent paragraph.
+        if p["start_sec"] < last_end - 0.5:
+            continue
+        ts = _format_hms(p["start_sec"])
+        if p["speaker"] is not None:
+            rendered.append(f"[{ts}] **Speaker {p['speaker']}:**\n{p['text']}")
+        else:
+            rendered.append(f"[{ts}]\n{p['text']}")
+        last_end = max(last_end, p["end_sec"])
+
+    return "\n\n".join(rendered)
 
 
 def _deduplicate_overlap(transcripts: list[str]) -> str:
@@ -737,7 +826,11 @@ def _transcribe_openai(
     text = response.text if hasattr(response, "text") else str(response)
     detected_language = getattr(response, "language", None)
 
-    return {"text": text, "detected_language": detected_language}
+    return {
+        "text": text,
+        "detected_language": detected_language,
+        "paragraphs": _extract_whisper_paragraphs(response),
+    }
 
 
 @retry(
@@ -771,7 +864,11 @@ def _transcribe_groq(
     text = response.text if hasattr(response, "text") else str(response)
     detected_language = getattr(response, "language", None)
 
-    return {"text": text, "detected_language": detected_language}
+    return {
+        "text": text,
+        "detected_language": detected_language,
+        "paragraphs": _extract_whisper_paragraphs(response),
+    }
 
 
 @retry(
@@ -842,23 +939,23 @@ def _transcribe_deepgram(
 
     # Parse response with null safety checks
     if not response or not response.results:
-        return {"text": "", "detected_language": None}
+        return {"text": "", "detected_language": None, "paragraphs": []}
 
     channels = getattr(response.results, "channels", None)
     if not channels or len(channels) == 0:
-        return {"text": "", "detected_language": None}
+        return {"text": "", "detected_language": None, "paragraphs": []}
 
     channel = channels[0]
     if not channel:
-        return {"text": "", "detected_language": None}
+        return {"text": "", "detected_language": None, "paragraphs": []}
 
     alternatives = getattr(channel, "alternatives", None)
     if not alternatives or len(alternatives) == 0:
-        return {"text": "", "detected_language": None}
+        return {"text": "", "detected_language": None, "paragraphs": []}
 
     alternative = alternatives[0]
     if not alternative:
-        return {"text": "", "detected_language": None}
+        return {"text": "", "detected_language": None, "paragraphs": []}
 
     # Extract the detected language from metadata if available
     detected_language: str | None = None
@@ -868,6 +965,8 @@ def _transcribe_deepgram(
 
     # Get the fully formatted transcript (with punctuation, smart formatting)
     full_transcript = getattr(alternative, "transcript", None) or ""
+
+    paragraphs_data = _extract_deepgram_paragraphs(alternative, diarize)
 
     if diarize:
         # Prefer Deepgram's structured `paragraphs` output: it already
@@ -882,9 +981,179 @@ def _transcribe_deepgram(
         if not text:
             # Ultimate fallback: the unformatted full transcript.
             text = full_transcript
-        return {"text": text, "detected_language": detected_language}
+        return {
+            "text": text,
+            "detected_language": detected_language,
+            "paragraphs": paragraphs_data,
+        }
     else:
-        return {"text": full_transcript, "detected_language": detected_language}
+        return {
+            "text": full_transcript,
+            "detected_language": detected_language,
+            "paragraphs": paragraphs_data,
+        }
+
+
+def _extract_deepgram_paragraphs(alternative, diarize: bool) -> list[dict]:
+    """Return a list of ``{text, start_sec, end_sec, speaker}`` dicts from
+    Deepgram's response, used by the timestamped-output path.
+
+    Falls back to walking the words list when ``alternative.paragraphs``
+    is missing — same fallback structure as the renderers, but here we
+    keep timing for every emitted block so the assembler can dedup
+    chunk-overlap regions by time and prepend ``[HH:MM:SS]`` markers.
+    Returns an empty list when no usable timing data is available; the
+    caller treats that as "no timestamps for this chunk."
+    """
+    paragraphs_obj = getattr(alternative, "paragraphs", None)
+    paragraphs_list = (
+        getattr(paragraphs_obj, "paragraphs", None) if paragraphs_obj else None
+    )
+
+    if paragraphs_list:
+        out: list[dict] = []
+        for para in paragraphs_list:
+            sentences = getattr(para, "sentences", None) or []
+            text = " ".join(
+                (getattr(s, "text", "") or "").strip()
+                for s in sentences
+                if getattr(s, "text", "")
+            ).strip()
+            if not text:
+                continue
+            speaker = getattr(para, "speaker", None) if diarize else None
+            out.append({
+                "text": text,
+                "start_sec": float(getattr(para, "start", 0.0) or 0.0),
+                "end_sec": float(getattr(para, "end", 0.0) or 0.0),
+                "speaker": speaker,
+            })
+        if out:
+            return out
+
+    return _extract_deepgram_paragraphs_from_words(alternative, diarize)
+
+
+def _extract_deepgram_paragraphs_from_words(alternative, diarize: bool) -> list[dict]:
+    """Word-loop fallback for paragraph extraction with timing.
+
+    Splits on speaker changes (when diarized) or pauses ≥1.5 s (always),
+    and records the start/end of each emitted block — same boundaries
+    used by :func:`_format_diarized_from_words`, just with timing
+    preserved so the timestamped assembler can place ``[HH:MM:SS]``
+    markers and dedup overlap regions.
+    """
+    words = getattr(alternative, "words", None)
+    if not words:
+        return []
+
+    PAUSE = 1.5
+    out: list[dict] = []
+    seg_words: list[str] = []
+    seg_start: float | None = None
+    seg_end: float | None = None
+    current_speaker: int | None = None
+    last_word_end: float | None = None
+
+    def _flush() -> None:
+        nonlocal seg_words, seg_start, seg_end
+        if seg_words and seg_start is not None and seg_end is not None:
+            out.append({
+                "text": " ".join(seg_words).strip(),
+                "start_sec": float(seg_start),
+                "end_sec": float(seg_end),
+                "speaker": current_speaker if diarize else None,
+            })
+        seg_words = []
+        seg_start = None
+        seg_end = None
+
+    for word in words:
+        speaker = getattr(word, "speaker", None)
+        word_start = getattr(word, "start", None)
+        word_end = getattr(word, "end", None)
+        word_text = (
+            getattr(word, "punctuated_word", None) or getattr(word, "word", "")
+        )
+
+        is_pause = (
+            last_word_end is not None
+            and word_start is not None
+            and (word_start - last_word_end) >= PAUSE
+        )
+        speaker_changed = diarize and speaker != current_speaker
+
+        if seg_words and (speaker_changed or is_pause):
+            _flush()
+
+        if not seg_words:
+            current_speaker = speaker
+            seg_start = word_start
+
+        if word_text:
+            seg_words.append(word_text)
+        if word_end is not None:
+            seg_end = word_end
+            last_word_end = word_end
+
+    _flush()
+    return out
+
+
+def _extract_whisper_paragraphs(response) -> list[dict]:
+    """Build paragraph timing data from Whisper's verbose_json segments.
+
+    Whisper has no native paragraph concept, but each segment has start
+    and end times. We group consecutive segments into paragraphs at
+    pauses ≥1.5 s — same threshold the Deepgram path uses — so the
+    timestamped output looks consistent across providers. Speaker is
+    always ``None`` (Whisper doesn't diarize).
+    """
+    segments = getattr(response, "segments", None) or []
+    if not segments:
+        return []
+
+    PAUSE = 1.5
+    out: list[dict] = []
+    current_words: list[str] = []
+    current_start: float | None = None
+    last_end: float | None = None
+
+    for seg in segments:
+        start = getattr(seg, "start", None)
+        end = getattr(seg, "end", None)
+        text = (getattr(seg, "text", "") or "").strip()
+        if not text or start is None or end is None:
+            continue
+
+        if (
+            current_words
+            and last_end is not None
+            and (start - last_end) >= PAUSE
+        ):
+            out.append({
+                "text": " ".join(current_words).strip(),
+                "start_sec": float(current_start or 0.0),
+                "end_sec": float(last_end),
+                "speaker": None,
+            })
+            current_words = []
+            current_start = None
+
+        if not current_words:
+            current_start = start
+        current_words.append(text)
+        last_end = end
+
+    if current_words and current_start is not None and last_end is not None:
+        out.append({
+            "text": " ".join(current_words).strip(),
+            "start_sec": float(current_start),
+            "end_sec": float(last_end),
+            "speaker": None,
+        })
+
+    return out
 
 
 def _format_diarized_from_paragraphs(alternative) -> str | None:
