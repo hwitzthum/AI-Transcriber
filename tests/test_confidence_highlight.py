@@ -236,11 +236,34 @@ def test_export_docx_with_low_confidence_succeeds():
     )
 
 
-def test_export_pdf_drops_low_confidence_markers():
+def test_export_pdf_with_low_confidence_runs_strip_helper(monkeypatch):
     """PDF body text can't carry per-word styling without restructuring
-    the layout, so the export drops the markers cleanly. The output
-    must not contain literal ``~~`` characters."""
+    the layout, so the export drops the markers cleanly. We verify the
+    behaviour by intercepting :func:`_strip_inline_markers` — checking
+    the bytes directly is unreliable because fpdf2 zlib-compresses the
+    content stream, and the ``~~`` byte pair occasionally appears in
+    the compressed output by chance.
+    """
     text = "**Speaker 0:**\nThis is ~~probably~~ accurate."
+
+    received: list[str] = []
+    original = exporter._strip_inline_markers
+
+    def _spy(arg):
+        received.append(arg)
+        return original(arg)
+
+    monkeypatch.setattr(exporter, "_strip_inline_markers", _spy)
+
     blob = exporter.export_pdf(text, title="Test")
     assert blob.startswith(b"%PDF")
-    assert b"~~" not in blob
+
+    # The PDF path must route the content (which contains ``~~``)
+    # through the strip helper before drawing it. The output of the
+    # helper has no markers, so what fpdf2 actually rasterises is
+    # marker-free regardless of how the bytes compress.
+    assert any("~~probably~~" in arg for arg in received), (
+        "PDF export must route low-confidence-wrapped content through "
+        "_strip_inline_markers — it did not"
+    )
+    assert all("~~" not in original(arg) for arg in received)

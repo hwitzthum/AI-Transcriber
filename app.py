@@ -8,13 +8,28 @@ mlx-whisper model (optimized for Apple Silicon) or cloud APIs
 Run with: uv run streamlit run app.py
 """
 
+import json
+import logging
 import os
 import tempfile
-import logging
+import warnings
 from pathlib import Path
+
+# Silence the deprecation warning emitted by deepgram-sdk's transitive
+# ``websockets.legacy`` import. Filed upstream; the websockets
+# ecosystem is mid-migration and we can't fix the SDK from here.
+# Filter is narrow (specific message + module + category) so it can't
+# accidentally hide our own deprecations. Must run before the cloud
+# engine import below — the warning fires at module-load time.
+warnings.filterwarnings(
+    "ignore",
+    message=".*websockets\\.legacy is deprecated.*",
+    category=DeprecationWarning,
+)
 
 import streamlit as st
 
+from transcriber import ai_summary
 from transcriber import audio_processor
 from transcriber import batch as batch_module
 from transcriber import cloud_engine
@@ -99,15 +114,21 @@ logger = logging.getLogger(__name__)
 _STYLES_CSS = (Path(__file__).parent / "assets" / "styles.css").read_text(encoding="utf-8")
 
 
-# Cached export functions
+# Cached export functions. ``summary_json`` is the JSON-serialised
+# summary dict (or ``""`` when none) — Streamlit's cache requires
+# hashable args, and a plain dict isn't, so we round-trip through JSON
+# at the cache boundary. The cost is negligible compared to the
+# DOCX/PDF render itself.
 @st.cache_data(show_spinner=False)
-def _cached_export_docx(text: str, title: str) -> bytes:
-    return exporter.export_docx(text, title=title)
+def _cached_export_docx(text: str, title: str, summary_json: str = "") -> bytes:
+    summary = json.loads(summary_json) if summary_json else None
+    return exporter.export_docx(text, title=title, summary=summary)
 
 
 @st.cache_data(show_spinner=False)
-def _cached_export_pdf(text: str, title: str) -> bytes:
-    return exporter.export_pdf(text, title=title)
+def _cached_export_pdf(text: str, title: str, summary_json: str = "") -> bytes:
+    summary = json.loads(summary_json) if summary_json else None
+    return exporter.export_pdf(text, title=title, summary=summary)
 
 
 # Preview-mode helpers run on every Streamlit rerun. The search box in the
@@ -188,6 +209,14 @@ if "url_download_path" not in st.session_state:
     st.session_state.url_download_path = None
 if "url_download_source" not in st.session_state:
     st.session_state.url_download_source = None
+if "ai_summary" not in st.session_state:
+    # Cached summary payload: ``{"summary", "topics", "action_items"}``
+    # or ``None`` when no summary has been generated. ``ai_summary_for_hash``
+    # tracks which transcript content the cache corresponds to, so user
+    # edits invalidate it without us having to re-run on every keystroke.
+    st.session_state.ai_summary = None
+if "ai_summary_for_hash" not in st.session_state:
+    st.session_state.ai_summary_for_hash = None
 
 
 
@@ -297,6 +326,51 @@ with st.sidebar:
             "useful for navigating long recordings."
         ),
     )
+
+    # ── AI summary ────────────────────────────────────────────────────────
+    # Optional post-processing: a single LLM call that turns the
+    # finished transcript into an executive summary, key-topic list,
+    # and action-item list. Off by default so users who just want a
+    # transcript don't get charged for an extra call.
+    st.divider()
+    st.markdown("### AI summary")
+    enable_ai_summary = st.checkbox(
+        "Generate after transcription",
+        value=False,
+        help=(
+            "Run a small LLM call after transcription to produce a "
+            "structured summary, key topics, and action items. "
+            "Adds a few seconds and a small cost; the result also lands "
+            "in the DOCX and PDF exports."
+        ),
+    )
+
+    summary_provider = next(iter(ai_summary.SUMMARY_PROVIDERS))
+    summary_api_key = ""
+    if enable_ai_summary:
+        summary_provider = st.selectbox(
+            "Summary provider",
+            list(ai_summary.SUMMARY_PROVIDERS.keys()),
+            help=(
+                "Both produce structured JSON. Groq is faster with a "
+                "free tier; OpenAI is slightly more accurate."
+            ),
+        )
+        # Reuse the transcription credential when the families match,
+        # so a user already keyed in for Groq transcription doesn't
+        # have to paste the same key twice.
+        summary_config = ai_summary.SUMMARY_PROVIDERS[summary_provider]
+        family = summary_config["matches_transcription_provider"]
+        if family in cloud_provider and api_key.strip():
+            summary_api_key = api_key
+            st.caption(f"Reusing your {family} transcription key.")
+        else:
+            summary_api_key = st.text_input(
+                f"{family} API key for summary",
+                type="password",
+                key=f"summary_api_key_{family}",
+                help="Used only for the summary call. Not stored.",
+            )
 
     # Language selection
     st.divider()
@@ -571,13 +645,43 @@ if uploaded_files and len(uploaded_files) > 1:
                         low_confidence_threshold=threshold,
                         progress_callback=_inner_progress,
                     )
+                    file_text = file_result.get("text", "") or ""
+
+                    # Per-file summary when the user opted in. We log
+                    # but don't abort if a single file's summary fails
+                    # — the transcript itself already succeeded, and
+                    # the user will see the missing summary in the
+                    # zip's docx without a confusing batch-level error.
+                    file_summary = None
+                    if (
+                        enable_ai_summary
+                        and summary_api_key
+                        and summary_api_key.strip()
+                        and file_text.strip()
+                    ):
+                        try:
+                            inner_status.markdown(
+                                f"_Generating summary for {batch_file.name}…_"
+                            )
+                            file_summary = ai_summary.summarize_transcript(
+                                file_text,
+                                provider=summary_provider,
+                                api_key=summary_api_key.strip(),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Summary failed for %s: %s",
+                                batch_file.name, exc,
+                            )
+
                     results.append({
                         "filename": batch_file.name,
-                        "text": file_result.get("text", "") or "",
+                        "text": file_text,
                         "detected_language": file_result.get("detected_language"),
                         "duration_seconds": file_result.get("duration_seconds") or 0.0,
                         "failed_chunks": file_result.get("failed_chunks") or [],
                         "quality_warnings": file_result.get("quality_warnings") or [],
+                        "summary": file_summary,
                         "error": None,
                     })
                 except Exception as exc:  # noqa: BLE001 — record + continue
@@ -909,6 +1013,68 @@ if audio_file_path:
 # ── Editor & Export ─────────────────────────────────────────────────────────
 
 if st.session_state.transcript:
+    # ── AI Summary ───────────────────────────────────────────────────────────
+    # Triggered only when the user opted in *and* gave us a key. The
+    # ``hash(transcript)`` guard means a Streamlit rerun (every
+    # checkbox toggle, search keystroke, etc.) doesn't re-charge the
+    # user — only a real transcript change does. User edits invalidate
+    # the cache; clicking Regenerate forces a fresh call.
+    if enable_ai_summary and summary_api_key and summary_api_key.strip():
+        transcript_hash = hash(st.session_state.transcript)
+        if st.session_state.ai_summary_for_hash != transcript_hash:
+            with st.spinner("Generating AI summary…"):
+                try:
+                    payload = ai_summary.summarize_transcript(
+                        st.session_state.transcript,
+                        provider=summary_provider,
+                        api_key=summary_api_key.strip(),
+                    )
+                    st.session_state.ai_summary = payload
+                    st.session_state.ai_summary_for_hash = transcript_hash
+                except ai_summary.SummaryError as exc:
+                    st.error(
+                        f"AI summary failed: {cloud_engine.redact_secrets(str(exc))}"
+                    )
+                    st.session_state.ai_summary = None
+                except Exception as exc:  # noqa: BLE001 — surface unknown SDK errors cleanly
+                    st.error(
+                        f"AI summary failed: {cloud_engine.redact_secrets(str(exc))}"
+                    )
+                    st.session_state.ai_summary = None
+                    logger.exception("AI summary unexpected error")
+
+    summary_payload = st.session_state.get("ai_summary")
+    if summary_payload and (
+        summary_payload.get("summary")
+        or summary_payload.get("topics")
+        or summary_payload.get("action_items")
+    ):
+        st.divider()
+        st.markdown(
+            '<div class="section-eyebrow"><span class="num">AI</span> Summary</div>',
+            unsafe_allow_html=True,
+        )
+        if summary_payload.get("summary"):
+            st.markdown(f"**Executive summary**\n\n{summary_payload['summary']}")
+        topics = summary_payload.get("topics") or []
+        if topics:
+            st.markdown("**Key topics**")
+            st.markdown("\n".join(f"- {t}" for t in topics))
+        actions = summary_payload.get("action_items") or []
+        if actions:
+            st.markdown("**Action items**")
+            st.markdown("\n".join(f"- {a}" for a in actions))
+        elif summary_payload.get("summary"):
+            # Distinguish "no actions found" from "summary not yet
+            # generated" — without this, a transcript with zero action
+            # items looks identical to one that hasn't been processed.
+            st.caption("_No action items identified in this transcript._")
+
+        if st.button("Regenerate summary", type="secondary"):
+            st.session_state.ai_summary = None
+            st.session_state.ai_summary_for_hash = None
+            st.rerun()
+
     st.divider()
     st.markdown(
         '<div class="section-eyebrow"><span class="num">03</span> Edit transcript</div>',
@@ -1040,9 +1206,19 @@ if st.session_state.transcript:
 
     col_docx, col_pdf = st.columns(2)
 
+    # JSON-serialise the summary once for both downloads — this is
+    # also what the cache key is built from, so identical inputs hit
+    # the same cached bytes regardless of the order the buttons render.
+    summary_for_export = st.session_state.get("ai_summary")
+    summary_json = (
+        json.dumps(summary_for_export, sort_keys=True)
+        if summary_for_export
+        else ""
+    )
+
     with col_docx:
         if edited_text.strip():
-            docx_bytes = _cached_export_docx(edited_text, "Transcription")
+            docx_bytes = _cached_export_docx(edited_text, "Transcription", summary_json)
             st.download_button(
                 label="Download · DOCX",
                 data=docx_bytes,
@@ -1054,7 +1230,7 @@ if st.session_state.transcript:
     with col_pdf:
         if edited_text.strip():
             try:
-                pdf_bytes = _cached_export_pdf(edited_text, "Transcription")
+                pdf_bytes = _cached_export_pdf(edited_text, "Transcription", summary_json)
                 st.download_button(
                     label="Download · PDF",
                     data=pdf_bytes,

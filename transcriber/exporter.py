@@ -96,7 +96,11 @@ def _create_pdf_with_unicode_font() -> Tuple[FPDF, str]:
 
     if _cached_font_path and os.path.isfile(_cached_font_path):
         try:
-            pdf.add_font("UniFont", "", _cached_font_path, uni=True)
+            # ``uni=True`` was the way to opt in to Unicode in fpdf 1.x
+            # and is deprecated in fpdf2 (≥2.5.1) where Unicode is the
+            # default. Dropping the kwarg eliminates the deprecation
+            # warning without changing behaviour.
+            pdf.add_font("UniFont", "", _cached_font_path)
             return pdf, "UniFont"
         except Exception:
             pass
@@ -212,7 +216,11 @@ def _strip_inline_markers(text: str) -> str:
     return cleaned
 
 
-def export_docx(text: str, title: str = "Transcription") -> bytes:
+def export_docx(
+    text: str,
+    title: str = "Transcription",
+    summary: Optional[dict] = None,
+) -> bytes:
     """
     Export text to a DOCX document with formatted speaker labels.
 
@@ -222,6 +230,10 @@ def export_docx(text: str, title: str = "Transcription") -> bytes:
     Args:
         text: The transcribed text content.
         title: Document title.
+        summary: Optional ``{"summary", "topics", "action_items"}`` dict
+            from :func:`transcriber.ai_summary.summarize_transcript`.
+            When provided, a "Summary" section is inserted between the
+            metadata header and the transcript proper.
 
     Returns:
         DOCX file content as bytes.
@@ -250,6 +262,10 @@ def export_docx(text: str, title: str = "Transcription") -> bytes:
 
     # Separator
     doc.add_paragraph("─" * 60)
+
+    if summary:
+        _add_summary_section_docx(doc, summary)
+        doc.add_paragraph("─" * 60)
 
     # Content — split by double newlines into paragraphs
     paragraphs = text.split("\n\n")
@@ -305,7 +321,11 @@ def export_docx(text: str, title: str = "Transcription") -> bytes:
     return buffer.getvalue()
 
 
-def export_pdf(text: str, title: str = "Transcription") -> bytes:
+def export_pdf(
+    text: str,
+    title: str = "Transcription",
+    summary: Optional[dict] = None,
+) -> bytes:
     """
     Export text to a PDF document with formatted speaker labels.
 
@@ -315,6 +335,7 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
     Args:
         text: The transcribed text content.
         title: Document title.
+        summary: Optional summary payload (see :func:`export_docx`).
 
     Returns:
         PDF file content as bytes.
@@ -349,6 +370,12 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
     pdf.set_draw_color(200, 200, 200)
     pdf.line(10, pdf.get_y() + 2, 200, pdf.get_y() + 2)
     pdf.ln(8)
+
+    if summary:
+        _add_summary_section_pdf(pdf, body_font, summary)
+        pdf.set_draw_color(200, 200, 200)
+        pdf.line(10, pdf.get_y() + 2, 200, pdf.get_y() + 2)
+        pdf.ln(8)
 
     # Content - process paragraphs with speaker label formatting
     paragraphs = text.split("\n\n")
@@ -396,3 +423,88 @@ def export_pdf(text: str, title: str = "Transcription") -> bytes:
     if isinstance(output, (bytes, bytearray)):
         return bytes(output)
     return output.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Summary rendering (DOCX + PDF)
+# ---------------------------------------------------------------------------
+
+def _add_summary_section_docx(doc, summary: dict) -> None:
+    """Render the AI summary block into a DOCX above the transcript.
+
+    Layout: an "AI Summary" heading, then the executive summary as a
+    single paragraph, then a "Key Topics" bulleted list, then an
+    "Action Items" bulleted list. Empty fields are skipped so a model
+    that found no action items doesn't leave an awkward empty heading.
+    """
+    doc.add_heading("AI Summary", level=2)
+
+    if summary.get("summary"):
+        para = doc.add_paragraph()
+        para.add_run(summary["summary"])
+        para.paragraph_format.space_after = Pt(8)
+
+    topics = summary.get("topics") or []
+    if topics:
+        topic_heading = doc.add_paragraph()
+        run = topic_heading.add_run("Key Topics")
+        run.bold = True
+        run.font.size = Pt(11)
+        topic_heading.paragraph_format.space_after = Pt(2)
+        for topic in topics:
+            bullet = doc.add_paragraph(style="List Bullet")
+            bullet.add_run(topic)
+
+    actions = summary.get("action_items") or []
+    if actions:
+        actions_heading = doc.add_paragraph()
+        run = actions_heading.add_run("Action Items")
+        run.bold = True
+        run.font.size = Pt(11)
+        actions_heading.paragraph_format.space_after = Pt(2)
+        for item in actions:
+            bullet = doc.add_paragraph(style="List Bullet")
+            bullet.add_run(item)
+
+
+def _add_summary_section_pdf(pdf, body_font: str, summary: dict) -> None:
+    """Mirror :func:`_add_summary_section_docx` for the PDF backend.
+
+    fpdf2 doesn't have a native bullet list, so we draw the bullet
+    glyph in the body text. The indent values match the speaker-block
+    indent so the summary section lines up visually with the
+    transcript that follows it.
+    """
+    pdf.set_font(body_font, "", 14)
+    pdf.set_text_color(33, 33, 33)
+    pdf.cell(0, 10, "AI Summary", new_x="LMARGIN", new_y="NEXT")
+
+    if summary.get("summary"):
+        pdf.set_font(body_font, "", 11)
+        pdf.set_text_color(51, 51, 51)
+        pdf.multi_cell(0, 6, summary["summary"])
+        pdf.ln(4)
+
+    topics = summary.get("topics") or []
+    if topics:
+        pdf.set_font(body_font, "", 12)
+        pdf.set_text_color(33, 33, 33)
+        pdf.cell(0, 7, "Key Topics", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font(body_font, "", 11)
+        pdf.set_text_color(51, 51, 51)
+        for topic in topics:
+            pdf.set_x(pdf.l_margin + 5)
+            pdf.multi_cell(0, 6, f"• {topic}")
+        pdf.ln(2)
+
+    actions = summary.get("action_items") or []
+    if actions:
+        pdf.set_font(body_font, "", 12)
+        pdf.set_text_color(33, 33, 33)
+        pdf.cell(0, 7, "Action Items", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font(body_font, "", 11)
+        pdf.set_text_color(51, 51, 51)
+        for item in actions:
+            pdf.set_x(pdf.l_margin + 5)
+            pdf.multi_cell(0, 6, f"• {item}")
+        pdf.ln(2)
