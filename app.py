@@ -154,7 +154,7 @@ def _cached_reading_stats(text: str) -> dict:
 _MAX_UPLOAD_BYTES = 2000 * 1024 * 1024
 
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ────────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="Transcriber",
@@ -174,7 +174,7 @@ except RuntimeError as _ffmpeg_err:
     st.error(str(_ffmpeg_err))
     st.stop()
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ── Custom CSS ────────────────────────────────────────────────────────────────────
 
 # Web fonts: inject <link> tags via st.html. @import inside an st.markdown
 # <style> block is stripped by Streamlit's HTML sanitizer, producing zero
@@ -193,7 +193,7 @@ st.html(
 st.markdown(_STYLES_CSS, unsafe_allow_html=True)
 
 
-# ── Session state ────────────────────────────────────────────────────────────
+# ── Session state ────────────────────────────────────────────────────────────────
 
 if "transcript" not in st.session_state:
     st.session_state.transcript = ""
@@ -327,7 +327,7 @@ with st.sidebar:
         ),
     )
 
-    # ── AI summary ────────────────────────────────────────────────────────
+    # ── AI summary ────────────────────────────────────────────────────────────────
     # Optional post-processing: a single LLM call that turns the
     # finished transcript into an executive summary, key-topic list,
     # and action-item list. Off by default so users who just want a
@@ -441,7 +441,7 @@ with st.sidebar:
     )
 
 
-# ── Main area ────────────────────────────────────────────────────────────────
+# ── Main area ────────────────────────────────────────────────────────────────────
 
 # Header
 st.markdown("""
@@ -457,7 +457,7 @@ st.markdown("""
 </header>
 """, unsafe_allow_html=True)
 
-# ── Input section ────────────────────────────────────────────────────────────
+# ── Input section ────────────────────────────────────────────────────────────────
 
 col_upload, col_path = st.columns(2)
 
@@ -495,7 +495,7 @@ with col_path:
     )
 
 
-# ── URL input row ────────────────────────────────────────────────────────────
+# ── URL input row ────────────────────────────────────────────────────────────────
 
 st.markdown(
     '<div class="section-eyebrow"><span class="num">03</span> Or paste a URL</div>',
@@ -567,7 +567,7 @@ if fetch_url_clicked and url_input.strip():
             st.error(str(exc))
 
 
-# ── Batch transcription ────────────────────────────────────────────────────
+# ── Batch transcription ───────────────────────────────────────────────────────────
 # Active when the uploader has more than one file. The single-file
 # resolution chain below this block (uploaded_file / path / URL) only
 # runs when there's exactly one file or no file at all, so the batch
@@ -750,7 +750,7 @@ if uploaded_files and len(uploaded_files) > 1:
     st.stop()
 
 
-# ── Resolve the audio source ────────────────────────────────────────────────
+# ── Resolve the audio source ───────────────────────────────────────────────────────────
 
 audio_file_path = None
 temp_upload_path = None
@@ -791,7 +791,7 @@ elif (
     audio_file_path = st.session_state.url_download_path
 
 
-# ── Audio info & Transcribe button ──────────────────────────────────────────
+# ── Audio info & Transcribe button ────────────────────────────────────────────────────────
 
 if audio_file_path:
     try:
@@ -823,7 +823,7 @@ if audio_file_path:
         audio_file_path = None
 
 
-# ── Transcription ───────────────────────────────────────────────────────────
+# ── Transcription ───────────────────────────────────────────────────────────────────────
 
 if audio_file_path:
     st.divider()
@@ -1010,10 +1010,10 @@ if audio_file_path:
 # previous upload's temp file the next time a different file arrives.
 
 
-# ── Editor & Export ─────────────────────────────────────────────────────────
+# ── Editor & Export ─────────────────────────────────────────────────────────────────
 
 if st.session_state.transcript:
-    # ── AI Summary ───────────────────────────────────────────────────────────
+    # ── AI Summary ───────────────────────────────────────────────────────────────────
     # Triggered only when the user opted in *and* gave us a key. The
     # ``hash(transcript)`` guard means a Streamlit rerun (every
     # checkbox toggle, search keystroke, etc.) doesn't re-charge the
@@ -1036,11 +1036,13 @@ if st.session_state.transcript:
                         f"AI summary failed: {cloud_engine.redact_secrets(str(exc))}"
                     )
                     st.session_state.ai_summary = None
+                    st.session_state.ai_summary_for_hash = transcript_hash
                 except Exception as exc:  # noqa: BLE001 — surface unknown SDK errors cleanly
                     st.error(
                         f"AI summary failed: {cloud_engine.redact_secrets(str(exc))}"
                     )
                     st.session_state.ai_summary = None
+                    st.session_state.ai_summary_for_hash = transcript_hash
                     logger.exception("AI summary unexpected error")
 
     summary_payload = st.session_state.get("ai_summary")
@@ -1081,7 +1083,7 @@ if st.session_state.transcript:
         unsafe_allow_html=True,
     )
 
-    # ── Readability Options ──────────────────────────────────────────────────
+    # ── Readability Options ────────────────────────────────────────────────────────────────
     with st.expander("Readability options", expanded=False):
         st.info(
             "**Paragraph breaks** are automatically inserted at natural pauses "
@@ -1101,7 +1103,7 @@ if st.session_state.transcript:
                 )
                 st.rerun()
 
-    # ── Speaker Renaming ─────────────────────────────────────────────────────
+    # ── Speaker Renaming ──────────────────────────────────────────────────────────────────
     speakers = text_processor.extract_speakers(st.session_state.transcript)
     if speakers:
         with st.expander("Rename speakers", expanded=False):
@@ -1134,7 +1136,7 @@ if st.session_state.transcript:
                     )
                     st.rerun()
 
-    # ── View Mode Toggle ─────────────────────────────────────────────────────
+    # ── View Mode Toggle ──────────────────────────────────────────────────────────────────
     col_mode, col_search = st.columns([1, 2])
     with col_mode:
         view_mode = st.radio(
@@ -1198,7 +1200,7 @@ if st.session_state.transcript:
         unsafe_allow_html=True,
     )
 
-    # ── Export Section ───────────────────────────────────────────────────────
+    # ── Export Section ───────────────────────────────────────────────────────────────────
     st.markdown(
         '<div class="section-eyebrow"><span class="num">04</span> Download</div>',
         unsafe_allow_html=True,
