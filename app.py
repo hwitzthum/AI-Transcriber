@@ -729,7 +729,10 @@ if uploaded_files and len(uploaded_files) > 1:
             else:
                 st.success(line)
 
-        zip_bytes = batch_module.build_zip(cached_results)
+        _batch_zip_key = f"_batch_zip_{hash(_batch_signature)}"
+        if _batch_zip_key not in st.session_state:
+            st.session_state[_batch_zip_key] = batch_module.build_zip(cached_results)
+        zip_bytes = st.session_state[_batch_zip_key]
         col_dl, col_clear = st.columns([3, 1])
         with col_dl:
             st.download_button(
@@ -742,6 +745,8 @@ if uploaded_files and len(uploaded_files) > 1:
         with col_clear:
             if st.button("Clear results", use_container_width=True):
                 del st.session_state[_batch_cache_key]
+                if _batch_zip_key in st.session_state:
+                    del st.session_state[_batch_zip_key]
                 st.rerun()
 
     # Bail out before the single-file pipeline below — there's no
