@@ -29,7 +29,7 @@ OVERLAP_MS = 5000
 
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac",
-    ".opus", ".webm", ".mp4", ".mov", ".avi", ".mkv",
+    ".opus", ".webm", ".mp4", ".mov", ".avi", ".mkv", ".aiff",
 }
 
 # Sensitive filesystem locations the user-facing path input must never resolve

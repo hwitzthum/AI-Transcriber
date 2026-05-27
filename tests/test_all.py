@@ -51,6 +51,7 @@ def test_audio_validation():
     # Valid AIFF 
     ok, msg = audio_processor.validate_file("tests/test_english.aiff")
     print(f"  ✅ Valid AIFF:  ok={ok}, msg={msg}")
+    assert ok, "AIFF validation failed"
     
     # Non-existent file
     ok, msg = audio_processor.validate_file("nonexistent.mp3")
