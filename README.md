@@ -41,7 +41,7 @@ Production-ready audio and video transcription powered by cloud AI. Optimised fo
 - **Speaker diarization** (Deepgram only) — `**Speaker 0:**`, `**Speaker 1:**`, …
 - **Three input modes** — drag-and-drop upload, local filesystem path, or URL paste (YouTube, podcast, any yt-dlp-supported source)
 - **Large file support** — automatic chunking with memory-efficient streaming, up to the 2 GB upload cap
-- **Audio + video formats** — MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, WEBM, MP4, MOV, AVI, MKV, WMA
+- **Audio + video formats** — MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, WEBM, MP4, MOV, AVI, MKV, WMA, AIFF
 
 ### Output quality
 - **Provider-aware chunking** — each provider's actual upload ceiling is respected (Deepgram is much higher than OpenAI/Groq)
