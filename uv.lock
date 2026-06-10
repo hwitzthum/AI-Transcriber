@@ -1441,7 +1441,7 @@ dependencies = [
     { name = "yt-dlp" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "pytest" },
 ]
@@ -1452,13 +1452,14 @@ requires-dist = [
     { name = "fpdf2", specifier = ">=2.8.5" },
     { name = "groq", specifier = ">=1.0.0" },
     { name = "openai", specifier = ">=2.21.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4.0" },
     { name = "python-docx", specifier = ">=1.2.0" },
     { name = "streamlit", specifier = ">=1.54.0" },
     { name = "tenacity", specifier = ">=8.0.0" },
     { name = "yt-dlp", specifier = ">=2026.3.17" },
 ]
-provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=7.4.0" }]
 
 [[package]]
 name = "typing-extensions"

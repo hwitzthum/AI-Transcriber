@@ -17,7 +17,7 @@ dependencies = [
 # Note: ffmpeg and ffprobe are required system binaries (not Python deps).
 # Install with: `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux).
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=7.4.0",
 ]
