@@ -8,9 +8,19 @@ Tests all key design decisions:
 """
 
 import os
+import shutil
 import sys
 
 import pytest
+
+# Skip tests that need ffmpeg/ffprobe when those binaries aren't on PATH.
+# The app requires them at startup (see transcriber/audio_processor.py:require_ffmpeg),
+# so these tests can only run in environments where they're installed.
+_FFTOOLS_AVAILABLE = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+requires_fftools = pytest.mark.skipif(
+    not _FFTOOLS_AVAILABLE,
+    reason="ffmpeg and ffprobe not found on PATH",
+)
 
 # Add project root to path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -123,6 +133,7 @@ def test_compute_upload_hash_uses_size():
     print(f"  ✅ Size is part of the hash — different lengths produce different hashes")
 
 
+@requires_fftools
 def test_chunking_threshold_per_provider():
     """A file under the OpenAI 24 MB limit reports needs_chunking=False;
     the same file with a tiny 1 KB limit reports True. Demonstrates the
@@ -153,6 +164,7 @@ def test_chunking_threshold_per_provider():
     print(f"  ✅ Single-chunk path returns 1 file at default limit")
 
 
+@requires_fftools
 def test_audio_info():
     """Test 2: Audio metadata extraction."""
     separator("Audio Metadata Extraction")
@@ -169,6 +181,7 @@ def test_audio_info():
     print("\n  ✅ Metadata extraction PASSED")
 
 
+@requires_fftools
 def test_chunking_logic():
     """Test 3: Chunking — verify the small file doesn't get split,
     and test chunking with a forced lower threshold via the max_bytes kwarg."""
@@ -208,6 +221,7 @@ def test_chunking_logic():
     print("\n  ✅ Chunking logic PASSED")
 
 
+@requires_fftools
 def test_iter_chunks_streaming():
     """``iter_chunks`` is the lazy variant used by the streaming pipeline.
 
@@ -255,6 +269,7 @@ def test_iter_chunks_streaming():
     print(f"  ✅ Multi-chunk path: announced total={total}, yielded {len(yielded)} paths")
 
 
+@requires_fftools
 def test_video_audio_extraction():
     """Verify video files are transcoded to MP3 audio via ffmpeg (the
     `_ensure_mp3` helper drops video with `-vn` and produces a speech-
@@ -334,6 +349,7 @@ def test_pdf_export(text):
     print("\n  ✅ PDF export PASSED")
 
 
+@requires_fftools
 def test_format_conversion():
     """Test 8: AIFF format conversion (non-MP3 input)."""
     separator("Format Conversion (AIFF → MP3)")
